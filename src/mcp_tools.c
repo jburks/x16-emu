@@ -1520,6 +1520,83 @@ static const mcp_tool tool_lookup_symbol = {
 	0
 };
 
+static bool
+run_list_symbols(mcp_job *job)
+{
+	const json_node *pn = json_get(job->args, "prefix"), *cn = json_get(job->args, "contains");
+	const json_node *ln = json_get(job->args, "include_linker"), *sn = json_get(job->args, "sort");
+	const char *prefix = NULL, *contains = NULL;
+	if (pn && (!(prefix = json_as_string(pn)) || pn->string_len != strlen(prefix))) {
+		mcp_job_fail(job, "prefix must be a string");
+		return true;
+	}
+	if (cn && (!(contains = json_as_string(cn)) || cn->string_len != strlen(contains))) {
+		mcp_job_fail(job, "contains must be a string");
+		return true;
+	}
+	if (ln && ln->type != JSON_BOOL) {
+		mcp_job_fail(job, "include_linker must be true or false");
+		return true;
+	}
+	const char *sort = sn ? json_as_string(sn) : "name";
+	if (!sort || (strcmp(sort, "name") && strcmp(sort, "address"))) {
+		mcp_job_fail(job, "sort must be \"name\" or \"address\"");
+		return true;
+	}
+	uint32_t limit = 100, offset = 0;
+	if (json_get(job->args, "limit") && (!arg_uint(job, "limit", &limit) || limit < 1 || limit > 1000)) {
+		mcp_job_fail(job, "limit must be an integer from 1 to 1000");
+		return true;
+	}
+	if (json_get(job->args, "offset") && !arg_uint(job, "offset", &offset)) {
+		mcp_job_fail(job, "offset must be a non-negative integer");
+		return true;
+	}
+	mcp_sym_entry *entries = malloc(limit * sizeof(*entries));
+	if (!entries) {
+		mcp_job_fail(job, "out of memory");
+		return true;
+	}
+	size_t matching;
+	size_t n = mcp_sym_list(prefix, contains, ln && ln->boolean, !strcmp(sort, "address"), offset, limit, entries, &matching);
+	char tmp[160];
+	snprintf(tmp, sizeof(tmp), "{\"loaded\":%zu,\"matching\":%zu,\"offset\":%u,\"returned\":%zu,\"symbols\":[",
+	         mcp_sym_count(), matching, offset, n);
+	json_buf_append(&job->text, tmp);
+	for (size_t i = 0; i < n; i++) {
+		json_buf_append(&job->text, i ? ",{\"name\":" : "{\"name\":");
+		json_buf_append_string(&job->text, entries[i].name, strlen(entries[i].name));
+		if (entries[i].bank >= 0) {
+			snprintf(tmp, sizeof(tmp), ",\"address\":\"0x%04X\",\"bank\":%d}", entries[i].address, entries[i].bank);
+		} else {
+			snprintf(tmp, sizeof(tmp), ",\"address\":\"0x%04X\",\"bank\":null}", entries[i].address);
+		}
+		json_buf_append(&job->text, tmp);
+	}
+	json_buf_append(&job->text, "]}");
+	free(entries);
+	return true;
+}
+
+static const mcp_tool tool_list_symbols = {
+	"list_symbols",
+	"Lists the loaded symbols, to check what load_symbols read or to find entry points without guessing names, e.g. "
+	"prefix \"vex_\". `prefix` keeps names that start with it and `contains` names that contain it (both "
+	"case-sensitive; with both, a name must satisfy both). Linker symbols (names that start and end with \"__\", "
+	"such as __BSS_SIZE__) are left out unless include_linker is true. sort is \"name\" (default) or \"address\". "
+	"The list is paged: limit (default 100, max 1000) and offset. The result gives loaded (all symbols), matching "
+	"(how many matched), returned, and the symbols as name, address and bank (null if none).",
+	"{\"type\":\"object\",\"properties\":{"
+		"\"prefix\":{\"type\":\"string\"},\"contains\":{\"type\":\"string\"},"
+		"\"include_linker\":{\"type\":\"boolean\",\"default\":false},"
+		"\"sort\":{\"type\":\"string\",\"enum\":[\"name\",\"address\"],\"default\":\"name\"},"
+		"\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000,\"default\":100},"
+		"\"offset\":{\"type\":\"integer\",\"minimum\":0,\"default\":0}},"
+	 "\"additionalProperties\":false}",
+	run_list_symbols,
+	0
+};
+
 // ---- reset / set_warp ----
 
 extern char *clipboard_buffer; // main.c: text queued for typing, owned by the paste machinery
@@ -2167,7 +2244,7 @@ static const mcp_tool tool_debug_stall = {
 const mcp_tool *const *
 mcp_tool_table(void)
 {
-	static const mcp_tool *table[48];
+	static const mcp_tool *table[52];
 	if (!table[0]) {
 		size_t n = 0;
 		table[n++] = &tool_get_registers;
@@ -2195,6 +2272,7 @@ mcp_tool_table(void)
 		table[n++] = &tool_load_prg;
 		table[n++] = &tool_load_symbols;
 		table[n++] = &tool_lookup_symbol;
+		table[n++] = &tool_list_symbols;
 		table[n++] = &tool_mouse_move;
 		table[n++] = &tool_mouse_button;
 		table[n++] = &tool_mouse_wheel;

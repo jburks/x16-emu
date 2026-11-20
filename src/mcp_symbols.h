@@ -27,4 +27,18 @@ bool mcp_sym_find(const char *expr, uint16_t *address, int *bank, char *err, siz
 // symbols such as __X_SIZE__ are not offered. Returns false if there is no such label.
 bool mcp_sym_describe(uint16_t address, char *out, size_t out_size);
 
+typedef struct {
+	const char *name;  // valid until the symbols are next loaded
+	uint16_t address;
+	int bank;          // -1: none
+} mcp_sym_entry;
+
+// Lists symbols for the list_symbols tool. A symbol matches if its name starts with prefix (if not NULL) and
+// contains `contains` (if not NULL); both are case-sensitive. Linker symbols (names that start and end with
+// "__") are left out unless include_linker. Matches are ordered by name, or by address (then name) with
+// by_address. Skips `offset` matches and stores up to `limit` in out. Returns the number stored; the number of
+// matches in total, not just the stored ones, goes to *matching.
+size_t mcp_sym_list(const char *prefix, const char *contains, bool include_linker, bool by_address,
+                    size_t offset, size_t limit, mcp_sym_entry *out, size_t *matching);
+
 #endif

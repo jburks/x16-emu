@@ -270,3 +270,27 @@ mcp_sym_describe(uint16_t address, char *out, size_t out_size)
 	}
 	return false;
 }
+
+size_t
+mcp_sym_list(const char *prefix, const char *contains, bool include_linker, bool by_address,
+             size_t offset, size_t limit, mcp_sym_entry *out, size_t *matching)
+{
+	size_t total = 0, stored = 0;
+	size_t plen = prefix ? strlen(prefix) : 0;
+	symbol_t **order = by_address ? by_addr : by_name;
+	for (size_t i = 0; i < count; i++) {
+		const symbol_t *sy = order[i];
+		if (prefix && strncmp(sy->name, prefix, plen) != 0) continue;
+		if (contains && !strstr(sy->name, contains)) continue;
+		if (!include_linker && is_linker_symbol(sy->name)) continue;
+		if (total >= offset && stored < limit) {
+			out[stored].name = sy->name;
+			out[stored].address = sy->address;
+			out[stored].bank = sy->bank;
+			stored++;
+		}
+		total++;
+	}
+	*matching = total;
+	return stored;
+}

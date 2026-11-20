@@ -25,6 +25,7 @@ check("boots to READY.", wait_screen(e, "READY."))
 e.ok("pause")
 check("no symbol field in get_registers before anything is loaded", "symbol" not in e.ok("get_registers"))
 err, t = e.call("set_breakpoint", {"address": "start"}); check("a label before load_symbols: 'no symbols are loaded'", err and "no symbols are loaded" in t, t)
+r = e.ok("list_symbols"); check("list_symbols before anything is loaded: an empty list, not an error", r["loaded"] == 0 and r["matching"] == 0 and r["symbols"] == [], r)
 
 r = e.ok("load_symbols", {"path": labels})
 check("load_symbols: 9 labels, 2 other lines skipped", r["loaded"] == 9 and r["skipped_lines"] == 2 and r["total"] == 9 and r["replaced"] is False, r)
@@ -48,6 +49,28 @@ e.ok("set_registers", {"rom_bank": 10}); check("ROM labels use the current ROM b
 e.ok("set_registers", {"rom_bank": 0}); check("...and not another ROM bank", look(address=0xC125)["symbol"] is None)
 err, t = e.call("lookup_symbol", {}); check("lookup needs name or address", err, t)
 err, t = e.call("lookup_symbol", {"name": "a", "address": 1}); check("not both", err, t)
+
+# ---- list_symbols ----
+def names(**kw): return [x["name"] for x in e.ok("list_symbols", kw)["symbols"]]
+r = e.ok("list_symbols")
+check("list_symbols: all 9 loaded, the linker symbol hidden by default, sorted by name",
+      r["loaded"] == 9 and r["matching"] == 8 and r["returned"] == 8 and [x["name"] for x in r["symbols"]] ==
+      ["counter", "data", "hiram", "loop", "ramlabel", "romlabel", "start", "withmem"], r)
+check("include_linker: true adds __X_SIZE__", names(include_linker=True)[0] == "__X_SIZE__" and len(names(include_linker=True)) == 9)
+check("prefix", names(prefix="r") == ["ramlabel", "romlabel"] and names(prefix="st") == ["start"])
+check("contains", names(contains="label") == ["ramlabel", "romlabel"] and names(contains="o") == ["counter", "loop", "romlabel"])
+check("prefix and contains must both match", names(prefix="r", contains="om") == ["romlabel"])
+check("matching is case-sensitive", names(prefix="S") == [] and names(contains="LABEL") == [])
+check("sort by address", names(sort="address") == ["counter", "start", "loop", "data", "withmem", "hiram", "ramlabel", "romlabel"], names(sort="address"))
+by = {x["name"]: x for x in e.ok("list_symbols")["symbols"]}
+check("entries carry address and bank (null when there is none)", by["start"] == {"name": "start", "address": "0x0600", "bank": None}
+      and by["romlabel"]["bank"] == 10 and by["romlabel"]["address"] == "0xC123" and by["ramlabel"]["bank"] == 3, by)
+r = e.ok("list_symbols", {"limit": 3}); check("limit pages the list: 3 returned, 8 matching", r["returned"] == 3 and r["matching"] == 8, r)
+r = e.ok("list_symbols", {"limit": 3, "offset": 6}); check("offset: the last two", r["returned"] == 2 and [x["name"] for x in r["symbols"]] == ["start", "withmem"] and r["offset"] == 6, r)
+r = e.ok("list_symbols", {"offset": 50}); check("an offset past the end: nothing returned, matching still counted", r["returned"] == 0 and r["matching"] == 8 and r["symbols"] == [], r)
+for label, a in (("limit 0", {"limit": 0}), ("limit 1001", {"limit": 1001}), ("limit not a number", {"limit": "x"}), ("a bad sort", {"sort": "size"}),
+                 ("include_linker not a boolean", {"include_linker": "yes"}), ("a numeric prefix", {"prefix": 5}), ("a negative offset", {"offset": -1})):
+    err, t = e.call("list_symbols", a); check("list_symbols rejects " + label, err, t)
 
 # ---- labels as addresses everywhere ----
 e.ok("write_memory", {"address": "start", "hex": "A905 8510 E610 4C0406 55"})     # start: LDA #5 / STA $10 / loop: INC $10 / JMP loop ... data: $55

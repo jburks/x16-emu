@@ -409,6 +409,7 @@ Load the labels of the program under test and use names instead of addresses.
 |---|---|---|
 | `load_symbols` | `path`\*, `replace` | Loads a ca65/ld65 label file, as written by `ld65 -Ln file.sym`: VICE-format lines such as `al 000801 .main`. Other lines are skipped and counted. Labels are added to those already loaded unless `replace: true`; a file with no labels changes nothing. The path must lie inside the host path root. |
 | `lookup_symbol` | `name` or `address` | `name` (`main`, `main+4`) returns the address and bank; `address` returns the nearest label at or below it, as `name+0xN`, or `null`. |
+| `list_symbols` | `prefix`, `contains`, `include_linker`, `sort`, `limit`, `offset` | Lists the loaded symbols, to check what `load_symbols` read or to find entry points without guessing names (`prefix: "vex_"`). `prefix` keeps names that start with it and `contains` names that contain it (case-sensitive; both must match). Linker symbols such as `__BSS_SIZE__` are left out unless `include_linker: true`. `sort` is `name` (default) or `address`. Paged by `limit` (default 100, at most 1000) and `offset`. Returns `loaded`, `matching`, `returned` and the symbols as `name`, `address` and `bank` (`null` if none). |
 
 Once symbols are loaded:
 
