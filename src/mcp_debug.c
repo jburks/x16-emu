@@ -15,6 +15,7 @@ mcp_stop_info mcp_last_stop = { STOP_NONE, 0 };
 int mcp_bp_active = 0;
 bool mcp_debug_armed = false;
 int mcp_watch_active = 0;
+int mcp_vwatch_active = 0;
 bool mcp_watch_suppress = false;
 
 extern uint32_t frames;             // timing.c
@@ -47,16 +48,28 @@ static uint32_t step_left;
 
 typedef struct {
 	int id;
-	uint16_t address;
+	int space;
+	uint32_t address;
 	uint32_t length;
 	int bank;
 	int access;
 	unsigned hits;
 } watch_t;
 static watch_t watches[MCP_MAX_WATCHPOINTS];
+static int watch_total;
 static int next_watch_id = 1;
 static bool watch_pending;
-static struct { int id; uint16_t address; bool write; uint8_t value; uint16_t pc; } watch_hit;
+static struct { int id; int space; uint32_t address; bool write; uint8_t value; uint16_t pc; int port; } watch_hit;
+
+static void
+recount_watches(void)
+{
+	mcp_watch_active = mcp_vwatch_active = 0;
+	for (int i = 0; i < watch_total; i++) {
+		if (watches[i].space == WATCH_SPACE_VRAM) mcp_vwatch_active++;
+		else mcp_watch_active++;
+	}
+}
 
 static void
 rearm(void)
@@ -170,37 +183,39 @@ mcp_step_begin(uint32_t n)
 }
 
 int
-mcp_watch_add(uint16_t address, uint32_t length, int bank, int access, bool *existed)
+mcp_watch_add(int space, uint32_t address, uint32_t length, int bank, int access, bool *existed)
 {
-	for (int i = 0; i < mcp_watch_active; i++) {
-		if (watches[i].address == address && watches[i].length == length && watches[i].bank == bank
-		    && watches[i].access == access) {
+	for (int i = 0; i < watch_total; i++) {
+		if (watches[i].space == space && watches[i].address == address && watches[i].length == length
+		    && watches[i].bank == bank && watches[i].access == access) {
 			*existed = true;
 			return watches[i].id;
 		}
 	}
 	*existed = false;
-	if (mcp_watch_active >= MCP_MAX_WATCHPOINTS) {
+	if (watch_total >= MCP_MAX_WATCHPOINTS) {
 		return -1;
 	}
-	watch_t *w = &watches[mcp_watch_active];
+	watch_t *w = &watches[watch_total++];
 	w->id = next_watch_id++;
+	w->space = space;
 	w->address = address;
 	w->length = length;
 	w->bank = bank;
 	w->access = access;
 	w->hits = 0;
-	mcp_watch_active++;
+	recount_watches();
 	return w->id;
 }
 
 bool
 mcp_watch_remove(int id)
 {
-	for (int i = 0; i < mcp_watch_active; i++) {
+	for (int i = 0; i < watch_total; i++) {
 		if (watches[i].id == id) {
-			memmove(&watches[i], &watches[i + 1], (size_t)(mcp_watch_active - i - 1) * sizeof(watches[0]));
-			mcp_watch_active--;
+			memmove(&watches[i], &watches[i + 1], (size_t)(watch_total - i - 1) * sizeof(watches[0]));
+			watch_total--;
+			recount_watches();
 			return true;
 		}
 	}
@@ -210,22 +225,47 @@ mcp_watch_remove(int id)
 void
 mcp_watch_clear(void)
 {
-	mcp_watch_active = 0;
+	watch_total = 0;
+	recount_watches();
+}
+
+int
+mcp_watch_total(void)
+{
+	return watch_total;
 }
 
 bool
-mcp_watch_get(int index, int *id, uint16_t *address, uint32_t *length, int *bank, int *access, unsigned *hits)
+mcp_watch_get(int index, int *id, int *space, uint32_t *address, uint32_t *length, int *bank, int *access,
+              unsigned *hits)
 {
-	if (index < 0 || index >= mcp_watch_active) {
+	if (index < 0 || index >= watch_total) {
 		return false;
 	}
 	*id = watches[index].id;
+	*space = watches[index].space;
 	*address = watches[index].address;
 	*length = watches[index].length;
 	*bank = watches[index].bank;
 	*access = watches[index].access;
 	*hits = watches[index].hits;
 	return true;
+}
+
+static void
+record_hit(const watch_t *w, uint32_t address, bool write, uint8_t value, int port)
+{
+	if (!watch_pending) {
+		watch_pending = true;
+		watch_hit.id = w->id;
+		watch_hit.space = w->space;
+		watch_hit.address = address;
+		watch_hit.write = write;
+		watch_hit.value = value;
+		watch_hit.pc = opcode_addr;
+		watch_hit.port = port;
+		mcp_debug_armed = true;
+	}
 }
 
 // Called from inside an instruction. Records the first hit; the emulator stops
@@ -237,20 +277,31 @@ mcp_watch_hit(uint16_t address, bool write, uint8_t value)
 		return;
 	}
 	int want = write ? WATCH_WRITE : WATCH_READ;
-	for (int i = 0; i < mcp_watch_active; i++) {
+	for (int i = 0; i < watch_total; i++) {
 		watch_t *w = &watches[i];
-		if ((w->access & want) && (uint32_t)(address - w->address) < w->length && address >= w->address
+		if (w->space != WATCH_SPACE_CPU) {
+			continue;
+		}
+		if ((w->access & want) && (uint32_t)address >= w->address && (uint32_t)address - w->address < w->length
 		    && bank_ok(w->bank, address)) {
 			w->hits++;
-			if (!watch_pending) {
-				watch_pending = true;
-				watch_hit.id = w->id;
-				watch_hit.address = address;
-				watch_hit.write = write;
-				watch_hit.value = value;
-				watch_hit.pc = opcode_addr;
-				mcp_debug_armed = true;
-			}
+			record_hit(w, address, write, value, -1);
+			return;
+		}
+	}
+}
+
+void
+mcp_vram_watch_hit(uint32_t address, uint8_t value, int port)
+{
+	if (mcp_watch_suppress || mcp_is_paused()) {
+		return;
+	}
+	for (int i = 0; i < watch_total; i++) {
+		watch_t *w = &watches[i];
+		if (w->space == WATCH_SPACE_VRAM && address >= w->address && address - w->address < w->length) {
+			w->hits++;
+			record_hit(w, address, true, value, port);
 			return;
 		}
 	}
@@ -323,9 +374,15 @@ mcp_describe_stop(json_buf *out)
 		json_buf_append(out, tmp);
 	}
 	if (mcp_is_paused() && mcp_last_stop.reason == STOP_WATCHPOINT) {
-		snprintf(tmp, sizeof(tmp), ",\"watchpoint\":%d,\"access\":\"%s\",\"address\":\"0x%04X\",\"value\":\"0x%02X\","
-		         "\"accessing_pc\":\"0x%04X\"", watch_hit.id, watch_hit.write ? "write" : "read",
-		         watch_hit.address, watch_hit.value, watch_hit.pc);
+		if (watch_hit.space == WATCH_SPACE_VRAM) {
+			snprintf(tmp, sizeof(tmp), ",\"watchpoint\":%d,\"space\":\"vram\",\"access\":\"write\",\"address\":\"0x%05X\","
+			         "\"value\":\"0x%02X\",\"data_port\":%d,\"accessing_pc\":\"0x%04X\"", watch_hit.id,
+			         watch_hit.address, watch_hit.value, watch_hit.port, watch_hit.pc);
+		} else {
+			snprintf(tmp, sizeof(tmp), ",\"watchpoint\":%d,\"space\":\"cpu\",\"access\":\"%s\",\"address\":\"0x%04X\","
+			         "\"value\":\"0x%02X\",\"accessing_pc\":\"0x%04X\"", watch_hit.id, watch_hit.write ? "write" : "read",
+			         watch_hit.address, watch_hit.value, watch_hit.pc);
+		}
 		json_buf_append(out, tmp);
 	}
 	json_buf_append(out, "}");

@@ -293,24 +293,45 @@ A watchpoint stop adds `watchpoint`, `access`, `address`, `value` and
 | `set_breakpoint` | `address`\*, `bank` | Pauses just before the instruction at `address` executes. From `$A000` up, `bank` restricts it to that RAM bank (`$A000-$BFFF`) or ROM bank (`$C000-$FFFF`); without it the breakpoint matches in any bank. Max 64. Returns the id (the existing one if already set). |
 | `clear_breakpoint` | `id` or `all` | Removes one or all |
 | `list_breakpoints` | none | Ids, addresses, banks and hit counts |
-| `set_watchpoint` | `address`\*, `length`, `access`, `bank` | Pauses after an instruction that reads and/or writes the range. `access` is `read`, `write` (default) or `readwrite`. Max 32. |
+| `set_watchpoint` | `address`\*, `length`, `access`, `bank`, `space` | Pauses after an instruction that accesses the range. `space` is `cpu` (default) or `vram`. For `cpu`, `access` is `read`, `write` (default) or `readwrite`. For `vram` only writes are watched. Max 32 watchpoints in all. |
 | `clear_watchpoint` | `id` or `all` | Removes one or all |
-| `list_watchpoints` | none | Ids, ranges, access types, banks and hit counts |
+| `list_watchpoints` | none | Ids, spaces, ranges, access types, banks and hit counts |
 
 Resuming from a breakpoint executes that instruction once without hitting it
 again. Resuming after a watchpoint hit does not re-trigger it.
 
-Watchpoint limits to know about:
+**CPU watchpoints** (`space: "cpu"`):
 
-- Only **CPU accesses** are seen. A VRAM write through the VERA data port shows
-  up as an access to `$9F23` or `$9F24`, not as a VRAM address.
+- They see **CPU accesses**: the stop reports `accessing_pc` (the instruction
+  that did it), the address and the value. The emulator stops after that
+  instruction completes, so `pc` points at the next one. If an instruction
+  touches the range more than once, the first access is reported.
 - **Instruction fetches count as reads**, so a read watch on code fires when it
   executes.
-- Accesses made by the tools themselves (`read_memory`, `write_memory`) are not
-  reported.
-- The emulator stops after the accessing instruction completes, so `pc` points
-  at the next instruction; `accessing_pc` is the one that did the access. If an
-  instruction touches the range more than once, the first access is reported.
+- A write through the VERA data port shows up here as an access to `$9F23` or
+  `$9F24`, not as a VRAM address. Use a VRAM watchpoint for that.
+
+**VRAM watchpoints** (`space: "vram"`, writes only):
+
+- `address` and `length` are in the 128 KB VERA space (`0x00000-0x1FFFF`). A hit
+  reports the VRAM `address` of the first byte written inside your range, the
+  `value` now stored there, `data_port` (0 for `$9F23`, 1 for `$9F24`) and
+  `accessing_pc`. Writes through either data port are covered, including ones
+  made while FX is active.
+- One CPU store can write several bytes. An FX cache write stores up to four
+  (starting at the 4-byte boundary below the data port's address), and a 4-bit
+  write changes only half a byte. A hit is reported if **any byte the store
+  writes** lies in the range, even when the CPU's own address does not. A store
+  that FX skips (a transparent write of zero, or a nibble masked out) is not a
+  write. The reported value is the whole byte as it is now in VRAM.
+- Every VRAM write is made by a CPU store to a data port (VERA has no DMA), so
+  `accessing_pc` is always the instruction responsible.
+- **Reads are not supported.** VERA prefetches the byte when an address is set,
+  so a "read" event would not correspond to a CPU access and could name the
+  wrong instruction.
+
+Writes made by the tools (`write_memory`, including `space: "vram"`) do not
+trigger any watchpoint.
 
 ### Change state and send input
 
@@ -419,7 +440,7 @@ To test a small routine without a build step:
 
 ## Limitations
 
-- No watchpoints on VRAM addresses, no data-dependent conditions on breakpoints.
+- No data-dependent conditions on breakpoints or watchpoints, and no VRAM read watchpoints (see above).
 - `load_prg` assumes the release 49 layout of BASIC's pointers (see above), and
   warns on ROMs detectably older than that.
 - No audio inspection, and no joystick input.

@@ -496,7 +496,7 @@ run_continue(mcp_job *job)
 			mcp_job_fail(job, "wait must be true or false");
 			return true;
 		}
-		if (wait && mcp_bp_active == 0 && mcp_watch_active == 0) {
+		if (wait && mcp_bp_active == 0 && mcp_watch_total() == 0) {
 			mcp_job_fail(job, "wait=true needs at least one breakpoint or watchpoint, otherwise it would never return");
 			return true;
 		}
@@ -748,14 +748,24 @@ access_name(int a)
 static bool
 run_set_watchpoint(mcp_job *job)
 {
-	uint32_t address, length = 1, bank = 0;
-	if (!arg_uint(job, "address", &address) || address > 0xFFFF) {
-		mcp_job_fail(job, "address is required: 0 to 0xFFFF as an integer or a string like \"0x9F23\" or \"$9F23\"");
+	const json_node *spn = json_get(job->args, "space");
+	const char *space = spn ? json_as_string(spn) : "cpu";
+	if (!space || (strcmp(space, "cpu") && strcmp(space, "vram"))) {
+		mcp_job_fail(job, "space must be \"cpu\" or \"vram\"");
 		return true;
 	}
-	if (json_get(job->args, "length") && (!arg_uint(job, "length", &length) || length < 1 || length > 0x10000
-	                                       || address + length > 0x10000)) {
-		mcp_job_fail(job, "length must be at least 1 and the range must stay within $0000-$FFFF");
+	bool vram = !strcmp(space, "vram");
+	uint32_t limit = vram ? 0x20000u : 0x10000u;
+	uint32_t address, length = 1, bank = 0;
+	if (!arg_uint(job, "address", &address) || address >= limit) {
+		mcp_job_fail(job, vram ? "address is required: 0 to 0x1FFFF as an integer or a string like \"0x0A000\""
+		                       : "address is required: 0 to 0xFFFF as an integer or a string like \"0x9F23\" or \"$9F23\"");
+		return true;
+	}
+	if (json_get(job->args, "length") && (!arg_uint(job, "length", &length) || length < 1 || length > limit
+	                                       || address + length > limit)) {
+		mcp_job_fail(job, vram ? "length must be at least 1 and the range must stay within VRAM (0x00000-0x1FFFF)"
+		                       : "length must be at least 1 and the range must stay within $0000-$FFFF");
 		return true;
 	}
 	int access = WATCH_WRITE;
@@ -772,14 +782,23 @@ run_set_watchpoint(mcp_job *job)
 	}
 	int b = -1;
 	if (json_get(job->args, "bank")) {
+		if (vram) {
+			mcp_job_fail(job, "bank only applies to space \"cpu\"");
+			return true;
+		}
 		if (!arg_uint(job, "bank", &bank) || bank > 255) {
 			mcp_job_fail(job, "bank must be an integer from 0 to 255");
 			return true;
 		}
 		b = (int)bank;
 	}
+	if (vram && access != WATCH_WRITE) {
+		mcp_job_fail(job, "VRAM watchpoints see writes only. VRAM reads are not supported: VERA prefetches the byte "
+		                  "when an address is set, so a read event would not correspond to a CPU access");
+		return true;
+	}
 	bool existed;
-	int id = mcp_watch_add((uint16_t)address, length, b, access, &existed);
+	int id = mcp_watch_add(vram ? WATCH_SPACE_VRAM : WATCH_SPACE_CPU, address, length, b, access, &existed);
 	if (id < 0) {
 		mcp_job_fail(job, "too many watchpoints (32 maximum)");
 		return true;
@@ -788,26 +807,34 @@ run_set_watchpoint(mcp_job *job)
 	if (b >= 0) {
 		snprintf(bankstr, sizeof(bankstr), "%d", b);
 	}
-	char tmp[200];
-	snprintf(tmp, sizeof(tmp), "{\"id\":%d,\"address\":\"0x%04X\",\"length\":%u,\"access\":\"%s\",\"bank\":%s,\"already_set\":%s}",
-	         id, address, length, access_name(access), bankstr, existed ? "true" : "false");
+	char tmp[260];
+	snprintf(tmp, sizeof(tmp),
+	         "{\"id\":%d,\"space\":\"%s\",\"address\":\"0x%0*X\",\"length\":%u,\"access\":\"%s\",\"bank\":%s,"
+	         "\"already_set\":%s}",
+	         id, space, vram ? 5 : 4, address, length, access_name(access), bankstr, existed ? "true" : "false");
 	json_buf_append(&job->text, tmp);
 	return true;
 }
 
 static const mcp_tool tool_set_watchpoint = {
 	"set_watchpoint",
-	"Pauses the emulator when the CPU reads and/or writes an address range (default: writes to one byte). The "
-	"emulator stops right after the accessing instruction completes; the result reports watchpoint, access, address, "
-	"value and accessing_pc. Instruction fetches count as reads, so a read watch on code fires when it executes. "
-	"Only CPU accesses are seen: VRAM writes through the VERA data ports show up as accesses to $9F23/$9F24, not as "
-	"VRAM addresses, and reads by tools are not reported. Addresses from $A000 up can be restricted to a RAM bank "
-	"($A000-$BFFF) or ROM bank ($C000-$FFFF). Resuming after a hit does not re-trigger it. Max 32.",
+	"Pauses the emulator when something accesses an address range. The emulator stops right after the accessing "
+	"instruction completes, and the result reports watchpoint, space, access, address, value and accessing_pc. "
+	"space \"cpu\" (default) watches CPU accesses, by default writes to one byte; `access` can be read, write or "
+	"readwrite. Instruction fetches count as reads, so a read watch on code fires when it executes. "
+	"Addresses from $A000 up can be restricted to a RAM bank ($A000-$BFFF) or ROM bank ($C000-$FFFF). "
+	"space \"vram\" watches writes (only) to VERA memory, 0x00000-0x1FFFF, through either "
+	"data port: it reports the VRAM address of the first byte written in your range, the byte now stored there, "
+	"data_port (0 or 1) and accessing_pc. One CPU store can write several bytes (FX cache writes store up to four, "
+	"and a 4-bit write changes half a byte): a hit is reported if any byte it writes lies in the range, and a store "
+	"that FX transparency or a nibble mask skips is not a write. Writes the tools make do not trigger "
+	"watchpoints. Resuming after a hit does not re-trigger it. Max 32 watchpoints in all.",
 	"{\"type\":\"object\",\"properties\":{"
+		"\"space\":{\"type\":\"string\",\"enum\":[\"cpu\",\"vram\"],\"default\":\"cpu\"},"
 		"\"address\":{\"type\":[\"integer\",\"string\"]},"
-		"\"length\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":65536,\"default\":1},"
-		"\"access\":{\"type\":\"string\",\"enum\":[\"read\",\"write\",\"readwrite\"],\"default\":\"write\"},"
-		"\"bank\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255}},"
+		"\"length\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":131072,\"default\":1},"
+		"\"access\":{\"type\":\"string\",\"enum\":[\"read\",\"write\",\"readwrite\"],\"default\":\"write\",\"description\":\"vram: write only\"},"
+		"\"bank\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255,\"description\":\"cpu space only\"}},"
 	 "\"required\":[\"address\"],\"additionalProperties\":false}",
 	run_set_watchpoint,
 	0,
@@ -825,7 +852,7 @@ run_clear_watchpoint(mcp_job *job)
 			mcp_job_fail(job, "pass either id or all, not both");
 			return true;
 		}
-		int n = mcp_watch_active;
+		int n = mcp_watch_total();
 		mcp_watch_clear();
 		char tmp[48];
 		snprintf(tmp, sizeof(tmp), "{\"removed\":%d}", n);
@@ -857,18 +884,20 @@ static bool
 run_list_watchpoints(mcp_job *job)
 {
 	json_buf_append(&job->text, "[");
-	int id, bank, access, i = 0;
-	uint16_t address;
-	uint32_t length;
+	int id, space, bank, access, i = 0;
+	uint32_t address, length;
 	unsigned hits;
-	while (mcp_watch_get(i, &id, &address, &length, &bank, &access, &hits)) {
+	while (mcp_watch_get(i, &id, &space, &address, &length, &bank, &access, &hits)) {
 		char bankstr[16] = "null";
 		if (bank >= 0) {
 			snprintf(bankstr, sizeof(bankstr), "%d", bank);
 		}
-		char tmp[200];
-		snprintf(tmp, sizeof(tmp), "%s{\"id\":%d,\"address\":\"0x%04X\",\"length\":%u,\"access\":\"%s\",\"bank\":%s,\"hits\":%u}",
-		         i ? "," : "", id, address, length, access_name(access), bankstr, hits);
+		char tmp[260];
+		snprintf(tmp, sizeof(tmp),
+		         "%s{\"id\":%d,\"space\":\"%s\",\"address\":\"0x%0*X\",\"length\":%u,\"access\":\"%s\",\"bank\":%s,"
+		         "\"hits\":%u}",
+		         i ? "," : "", id, space == WATCH_SPACE_VRAM ? "vram" : "cpu", space == WATCH_SPACE_VRAM ? 5 : 4, address,
+		         length, access_name(access), bankstr, hits);
 		json_buf_append(&job->text, tmp);
 		i++;
 	}
@@ -878,7 +907,7 @@ run_list_watchpoints(mcp_job *job)
 
 static const mcp_tool tool_list_watchpoints = {
 	"list_watchpoints",
-	"Lists the watchpoints with their ids, ranges, access types, banks (null = any) and hit counts.",
+	"Lists the watchpoints with their ids, spaces (cpu or vram), ranges, access types, banks (null = any) and hit counts.",
 	"{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
 	run_list_watchpoints,
 	0,

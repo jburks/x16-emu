@@ -9,6 +9,7 @@
 #endif
 
 #include "video.h"
+#include "mcp_internal.h"
 #include "memory.h"
 #include "glue.h"
 #include "debugger.h"
@@ -98,6 +99,17 @@ bool no_keyboard_capture = false;
 bool kernal_mouse_enabled = false;
 
 static uint8_t video_ram[0x20000];
+
+// MCP VRAM watchpoints: called after the CPU stores a byte in VRAM through a data port. One integer test when
+// no watchpoint is set. vwatch_port says which data port the current write came through.
+static int vwatch_port = -1;
+static inline void
+vram_written(uint32_t address)
+{
+	if (mcp_vwatch_active) {
+		mcp_vram_watch_hit(address & 0x1FFFF, video_ram[address & 0x1FFFF], vwatch_port);
+	}
+}
 static uint8_t palette[256 * 2];
 static uint8_t sprite_data[128][8];
 
@@ -1798,14 +1810,19 @@ fx_video_space_write(uint32_t address, bool nibble, uint8_t value)
 		if (nibble) {
 			if (!fx_trans_writes || (value & 0x0f) > 0) {
 				video_ram[address & 0x1FFFF] = (video_ram[address & 0x1FFFF] & 0xf0) | (value & 0x0f);
+				vram_written(address);
 			}
 		} else {
 			if (!fx_trans_writes || (value & 0xf0) > 0) {
 				video_ram[address & 0x1FFFF] = (video_ram[address & 0x1FFFF] & 0x0f) | (value & 0xf0);
+				vram_written(address);
 			}
 		}
 	} else {
-		if (!fx_trans_writes || value > 0) video_ram[address & 0x1FFFF] = value;
+		if (!fx_trans_writes || value > 0) {
+			video_ram[address & 0x1FFFF] = value;
+			vram_written(address);
+		}
 	}
 	if (address >= ADDR_PSG_START && address < ADDR_PSG_END) {
 		audio_render();
@@ -1826,12 +1843,15 @@ fx_vram_cache_write(uint32_t address, uint8_t value, uint8_t mask)
 		switch (mask) {
 			case 0:
 				video_ram[address & 0x1FFFF] = value;
+				vram_written(address);
 				break;
 			case 1:
 				video_ram[address & 0x1FFFF] = (video_ram[address & 0x1FFFF] & 0x0f) | (value & 0xf0);
+				vram_written(address);
 				break;
 			case 2:
 				video_ram[address & 0x1FFFF] = (video_ram[address & 0x1FFFF] & 0xf0) | (value & 0x0f);
+				vram_written(address);
 				break;
 			case 3:
 				// Do nothing
@@ -2170,21 +2190,26 @@ void video_write(uint8_t reg, uint8_t value) {
 			break;
 		case 0x03:
 		case 0x04: {
+			vwatch_port = reg - 3;
 			if (fx_2bit_poking && fx_addr1_mode) {
 				fx_2bit_poking = false;
 				uint8_t mask = value >> 6;
 				switch (mask) {
 					case 0x00:
 						video_ram[io_addr[1] & 0x1FFFF] = (fx_cache[fx_cache_byte_index] & 0xc0) | (io_rddata[1] & 0x3f);
+						vram_written(io_addr[1]);
 						break;
 					case 0x01:
 						video_ram[io_addr[1] & 0x1FFFF] = (fx_cache[fx_cache_byte_index] & 0x30) | (io_rddata[1] & 0xcf);
+						vram_written(io_addr[1]);
 						break;
 					case 0x02:
 						video_ram[io_addr[1] & 0x1FFFF] = (fx_cache[fx_cache_byte_index] & 0x0c) | (io_rddata[1] & 0xf3);
+						vram_written(io_addr[1]);
 						break;
 					case 0x03:
 						video_ram[io_addr[1] & 0x1FFFF] = (fx_cache[fx_cache_byte_index] & 0x03) | (io_rddata[1] & 0xfc);
+						vram_written(io_addr[1]);
 						break;
 				}
 				break; // break out of the enclosing switch statement early, too

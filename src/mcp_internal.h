@@ -80,7 +80,8 @@ extern int mcp_bp_active; // number of breakpoints
 // True while anything needs mcp_debug_check() each pass (breakpoints, a step in progress, a pending watch hit).
 extern bool mcp_debug_armed;
 // Number of watchpoints; memory.c checks it on every CPU access so it must stay a plain int.
-extern int mcp_watch_active;
+extern int mcp_watch_active;  // number of CPU-space watchpoints
+extern int mcp_vwatch_active; // number of VRAM watchpoints (video.c checks this on every VRAM write)
 
 #define MCP_MAX_BREAKPOINTS 64
 int mcp_bp_add(uint16_t address, int bank, bool *existed); // bank -1 = any; returns id, or -1 if full
@@ -92,12 +93,18 @@ bool mcp_bp_get(int index, int *id, uint16_t *address, int *bank, unsigned *hits
 // the emulator after the accessing instruction completes.
 #define MCP_MAX_WATCHPOINTS 32
 typedef enum { WATCH_READ = 1, WATCH_WRITE = 2, WATCH_RW = 3 } mcp_watch_access_t;
-int mcp_watch_add(uint16_t address, uint32_t length, int bank, int access, bool *existed); // -1 if full
+typedef enum { WATCH_SPACE_CPU = 0, WATCH_SPACE_VRAM = 1 } mcp_watch_space_t;
+int mcp_watch_add(int space, uint32_t address, uint32_t length, int bank, int access, bool *existed); // -1 if full
 bool mcp_watch_remove(int id);
 void mcp_watch_clear(void);
-bool mcp_watch_get(int index, int *id, uint16_t *address, uint32_t *length, int *bank, int *access, unsigned *hits);
+int mcp_watch_total(void);
+bool mcp_watch_get(int index, int *id, int *space, uint32_t *address, uint32_t *length, int *bank, int *access,
+                   unsigned *hits);
 // Called from read6502/write6502 only when mcp_watch_active != 0.
 void mcp_watch_hit(uint16_t address, bool write, uint8_t value);
+// Called from video.c after the CPU stores a byte in VRAM through a data port (port 0 or 1), only when
+// mcp_vwatch_active != 0. value is the byte now in VRAM.
+void mcp_vram_watch_hit(uint32_t address, uint8_t value, int port);
 // Set while a tool performs its own memory accesses, so they do not trigger watchpoints.
 extern bool mcp_watch_suppress;
 // Starts executing `n` instructions from the paused state, then pauses (STOP_STEP).
