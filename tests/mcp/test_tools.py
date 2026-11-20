@@ -26,13 +26,15 @@ def check(name, cond, got=None):
 
 call("initialize", {"protocolVersion":"2025-11-25"})
 names = [t["name"] for t in call("tools/list")["result"]["tools"]]
-check("tools/list", names == ["get_registers","get_status","read_memory","get_screen","pause","continue","run_frames","set_breakpoint","clear_breakpoint","list_breakpoints","step","set_watchpoint","clear_watchpoint","list_watchpoints","write_memory","set_registers","send_key","type_text","load_prg","mouse_move","mouse_button","mouse_wheel"], names)
+check("tools/list", names == ["get_registers","get_status","read_memory","hash_memory","get_screen","get_vera_state","pause","continue","run_frames","set_breakpoint","clear_breakpoint","list_breakpoints","step","set_watchpoint","clear_watchpoint","list_watchpoints","write_memory","set_registers","reset","set_warp","send_key","type_text","load_prg","mouse_move","mouse_button","mouse_wheel"], names)
 time.sleep(1.5)
 
 # ---- read_memory ----
+text("pause")          # the KERNAL switches RAM banks from interrupts, so compare the two reads while stopped
 regs = json.loads(text("get_registers")[1])
 e, m = mem({"address": 0, "count": 2})
 check("cpu $0000/$0001 are the current RAM/ROM bank", not e and m["hex"] == "%02x%02x" % (regs["ram_bank"], regs["rom_bank"]), (m, regs))
+text("continue")
 for b in (0, 1, 4):
     e, m = mem({"address": "0xC000", "count": 256, "bank": b})
     check("ROM bank %d $C000..$C0FF matches rom.bin on disk" % b, not e and m["hex"] == rom[b*16384:b*16384+256].hex(), m if e else m["hex"][:32])

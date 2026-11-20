@@ -1592,6 +1592,55 @@ static const int increments[32] = {
 	640, -640,
 };
 
+void
+video_get_state(struct video_state *o)
+{
+	o->addrsel = io_addrsel;
+	o->dcsel = io_dcsel;
+	for (int i = 0; i < 2; i++) {
+		o->data[i].address = io_addr[i] & 0x1FFFF;
+		o->data[i].inc_raw = io_inc[i];
+		o->data[i].step = (int16_t)increments[io_inc[i]];
+		o->data[i].prefetch = io_rddata[i];
+		o->data[i].nibble_bit = fx_nibble_bit[i];
+		o->data[i].nibble_incr = fx_nibble_incr[i];
+	}
+	o->ien = ien & 0xF;
+	o->isr = isr;
+	o->irq_line = irq_line;
+	o->irq_out = video_get_irq_out();
+	o->ntsc = (reg_composer[0] & 2) != 0;
+	uint16_t scanline = o->ntsc ? ntsc_scan_pos_y % SCAN_HEIGHT : vga_scan_pos_y;
+	o->scanline = scanline >= 512 ? 511 : scanline;
+	o->fx_addr1_mode = fx_addr1_mode;
+	o->fx_4bit_mode = fx_4bit_mode;
+	o->fx_16bit_hop = fx_16bit_hop;
+	o->fx_cache_byte_cycling = fx_cache_byte_cycling;
+	o->fx_cache_fill = fx_cache_fill;
+	o->fx_cache_write = fx_cache_write;
+	o->fx_trans_writes = fx_trans_writes;
+	o->fx_2bit_poly = fx_2bit_poly;
+	o->fx_2bit_poking = fx_2bit_poking;
+	o->fx_affine_clip = fx_affine_clip;
+	o->fx_cache_increment_mode = fx_cache_increment_mode;
+	o->fx_cache_nibble_index = fx_cache_nibble_index;
+	o->fx_multiplier = fx_multiplier;
+	o->fx_subtract = fx_subtract;
+	o->fx_cache_byte_index = fx_cache_byte_index;
+	o->fx_16bit_hop_align = fx_16bit_hop_align;
+	o->fx_affine_map_size = fx_affine_map_size;
+	o->fx_x_pixel_increment = fx_x_pixel_increment;
+	o->fx_y_pixel_increment = fx_y_pixel_increment;
+	o->fx_x_pixel_position = fx_x_pixel_position;
+	o->fx_y_pixel_position = fx_y_pixel_position;
+	o->fx_poly_fill_length = fx_poly_fill_length;
+	o->fx_affine_tile_base = fx_affine_tile_base;
+	o->fx_affine_map_base = fx_affine_map_base;
+	memcpy(o->fx_cache, fx_cache, sizeof(fx_cache));
+	o->fx_mult_accumulator = fx_mult_accumulator;
+}
+
+
 uint32_t
 video_get_address(uint8_t sel)
 {

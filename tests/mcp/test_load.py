@@ -51,7 +51,7 @@ check("and returned to the BASIC prompt", wait_screen(e, "READY."))
 e.ok("pause")
 
 # ---- BASIC ----
-r = e.ok("load_prg", {"path": write("hello.prg", hello)})
+r = r0 = e.ok("load_prg", {"path": write("hello.prg", hello)})
 end = 0x0801 + len(hello) - 2
 check("BASIC load: detected, pointers set, end 0x%04X" % end, r["basic"] and r["basic_pointers"] == "set" and r["end"] == "0x%04X" % end, r)
 ptrs = e.ok("read_memory", {"address": 0x03E1, "count": 6})["hex"]
@@ -102,5 +102,33 @@ fails_with("raw not a boolean", {"path": write("r.bin", b"abc"), "raw": "yes", "
 check("a failed load changed nothing", e.ok("read_memory", {"address": 0x9EF0, "count": 4})["hex"] == "00000000")
 e.ok("type_text", {"text": "X"})
 fails_with("run while text is still being typed", {"path": write("ml.prg", ml), "run": True}, "still being typed")
+check("the result names the ROM release (r49 here) and has no warning", r0.get("rom_release") == "r49" and "warning" not in r0, r0)
 check("emulator exits cleanly", e.close() == 0)
+
+# ---- ROM release detection: patch the release byte ($FF80 in ROM bank 0 = file offset $3F80) ----
+def with_release(byte):
+    path = os.path.join(tmp, "rom_%02x.bin" % byte)
+    data = bytearray(rom); data[0x3F80] = byte
+    open(path, "wb").write(bytes(data))
+    return path
+for label, byte, expect_name, expect_warn in (("r40 (older)", 40, "r40", True), ("r48 (just older)", 48, "r48", True), ("r49", 49, "r49", False),
+                                              ("r50 (newer)", 50, "r50", False), ("custom build ($FF)", 0xFF, "custom build", False),
+                                              ("prerelease 48", 0xD0, "prerelease 48", True), ("prerelease 50", 0xCE, "prerelease 50", False)):
+    em = Emu(["-zeroram"], rom=with_release(byte))
+    wait_screen(em, "READY."); em.ok("pause")
+    r = em.ok("load_prg", {"path": write("hello.prg", hello)})
+    ok = r["rom_release"] == expect_name and ("warning" in r) == expect_warn and r["basic_pointers"] == "set"
+    check("ROM %s: release named %r, warning %s, pointers still set" % (label, expect_name, "given" if expect_warn else "absent"), ok, r)
+    if expect_warn:
+        check("   the warning mentions the release and the LOAD fallback", expect_name in r["warning"] and "LOAD" in r["warning"] and "r49" in r["warning"], r["warning"])
+    r = em.ok("load_prg", {"path": write("ml.prg", ml)})
+    check("   machine code loads get no warning (the pointers do not matter)", "warning" not in r, r)
+    em.close()
+
+# BASIC not booted yet: the start pointer is not there, so no pointers and no run
+em = Emu(["-zeroram"]); em.ok("pause"); em.ok("reset", {"zero_ram": True})
+r = em.ok("load_prg", {"path": write("hello.prg", hello)})
+err, t = em.call("load_prg", {"path": write("hello.prg", hello), "run": True})
+check("before BASIC has initialised: pointers not set, and run is refused", r["basic_pointers"].startswith("not set") and err and "pointers" in t, (r, t))
+em.close()
 finish()

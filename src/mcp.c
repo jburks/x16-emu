@@ -59,7 +59,14 @@ static SDL_mutex *queue_lock;
 static SDL_cond *queue_cond;
 static mcp_job *pending_head, *pending_tail;
 static mcp_job *active_head, *active_tail;
-static SDL_atomic_t work_flag; // nonzero while pending or active jobs may exist
+// Bit 0: pending or active jobs may exist. Bit 1: a new job is waiting to be taken over. Set by the reader
+// thread and cleared by the emulator thread, both under queue_lock; the emulator thread also reads it unlocked.
+#define WORK_JOBS 1
+#define WORK_NEW  2
+static SDL_atomic_t work_flag;
+extern uint32_t frames;               // timing.c
+static uint32_t last_poll_frame;      // frame counter at the last service_jobs() (emulator thread only)
+static bool poll_every_pass;          // some active job asked for per-pass polling (emulator thread only)
 static bool paused;            // emulator thread only
 
 // Newest first; the client's version is echoed if we know it.
@@ -196,8 +203,14 @@ static void service_jobs(void);
 void
 mcp_service(void)
 {
-	if (SDL_AtomicGet(&work_flag)) {
-		service_jobs();
+	int work = SDL_AtomicGet(&work_flag);
+	if (work) {
+		// Unfinished jobs only need a look when something can have changed for them: a new job arrived, a
+		// video frame completed, or the emulator is paused (no frames pass then). Polling every instruction
+		// would roughly halve the speed of a long run_frames.
+		if ((work & WORK_NEW) || poll_every_pass || paused || frames != last_poll_frame) {
+			service_jobs();
+		}
 	}
 	if (mcp_debug_armed && !paused) {
 		mcp_debug_check();
@@ -272,9 +285,18 @@ service_jobs(void)
 		job = next;
 	}
 
+	last_poll_frame = frames;
+	poll_every_pass = false;
+	for (mcp_job *j = active_head; j; j = j->next) {
+		if (j->tool->poll_every_pass) {
+			poll_every_pass = true;
+		}
+	}
 	SDL_LockMutex(queue_lock);
 	if (!pending_head && !active_head) {
 		SDL_AtomicSet(&work_flag, 0);
+	} else if (!pending_head) {
+		SDL_AtomicSet(&work_flag, WORK_JOBS);
 	}
 	SDL_UnlockMutex(queue_lock);
 }
@@ -355,7 +377,7 @@ run_tool(const char *id_json, const mcp_tool *tool, json_node *msg)
 	SDL_LockMutex(queue_lock);
 	if (pending_tail) pending_tail->next = job; else pending_head = job;
 	pending_tail = job;
-	SDL_AtomicSet(&work_flag, 1);
+	SDL_AtomicSet(&work_flag, WORK_JOBS | WORK_NEW);
 	while (!job->done) {
 		Uint32 elapsed = SDL_GetTicks() - started;
 		if (elapsed >= timeout) {

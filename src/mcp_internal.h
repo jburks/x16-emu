@@ -49,6 +49,10 @@ typedef struct mcp_tool {
 	// (timeout) on a job that had started but not finished. Use it to leave the
 	// emulator in a sane state. The job is dropped afterwards.
 	void (*cancel)(mcp_job *job);
+	// By default a job that is not finished is polled once per video frame while the emulator runs (and on
+	// every idle pass while it is paused), which keeps the cost of waiting negligible. A tool that needs to
+	// react between two instructions sets this to be polled on every pass instead.
+	bool poll_every_pass;
 } mcp_tool;
 
 // mcp_tools.c: the registry. Returns a NULL-terminated array.
@@ -108,6 +112,9 @@ void mcp_stop(mcp_stop_reason reason);
 const char *mcp_stop_name(void);
 // {"stopped":"...","pc":"0x....",...} describing the current stop state.
 void mcp_describe_stop(json_buf *out);
+
+// Exact number of CPU clock cycles executed since start (not just as of the last frame).
+uint64_t mcp_total_cycles(void);
 
 // Helpers for tool implementations
 void mcp_job_fail(mcp_job *job, const char *message);  // sets is_error and the text

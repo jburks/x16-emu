@@ -17,7 +17,16 @@ bool mcp_debug_armed = false;
 int mcp_watch_active = 0;
 bool mcp_watch_suppress = false;
 
-extern uint32_t frames; // timing.c
+extern uint32_t frames;             // timing.c
+extern int64_t cpu_ticks;           // timing.c: cycles up to the last completed frame
+extern uint32_t clockticks6502_old; // timing.c: the 32-bit cycle counter at that frame
+
+uint64_t
+mcp_total_cycles(void)
+{
+	// clockticks6502 wraps at 2^32, so only the difference since the last frame is meaningful
+	return (uint64_t)cpu_ticks + (uint32_t)(clockticks6502 - clockticks6502_old);
+}
 
 typedef struct {
 	int id;
@@ -303,6 +312,8 @@ mcp_describe_stop(json_buf *out)
 	char tmp[256];
 	snprintf(tmp, sizeof(tmp), "{\"stopped\":\"%s\",\"pc\":\"0x%04X\",\"frames\":%u,\"ram_bank\":%u,\"rom_bank\":%u",
 	         why, regs.pc, frames, memory_get_ram_bank(), memory_get_rom_bank());
+	json_buf_append(out, tmp);
+	snprintf(tmp, sizeof(tmp), ",\"cycles\":%llu", (unsigned long long)mcp_total_cycles());
 	json_buf_append(out, tmp);
 	snprintf(tmp, sizeof(tmp), ",\"a\":\"0x%02X\",\"x\":\"0x%02X\",\"y\":\"0x%02X\",\"sp\":\"0x%04X\",\"status\":\"0x%02X\"",
 	         regs.a & 0xFF, regs.xl, regs.yl, regs.sp, regs.status);

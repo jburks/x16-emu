@@ -51,6 +51,13 @@ Use an absolute path for `command`. If the emulator cannot find `rom.bin`, add
 `"-rom", "/path/to/rom.bin"` to `args`; by default it looks next to the
 executable.
 
+### Giving the emulator a disk
+
+`-fsroot /path/to/folder` makes a host folder the emulated drive, so BASIC
+`LOAD` and `SAVE` work on its files. Add it to the arguments in any of the
+examples above. It complements `load_prg`: `load_prg` puts a program straight
+into memory, while `-fsroot` lets programs find their own data files.
+
 ### Running in the background (no window)
 
 By default the emulator opens a window, which can pop up in front of what you
@@ -132,13 +139,26 @@ Tips:
   between reads, and `get_screen` may show a half-drawn frame.
 - **Reproducible runs.** RAM contents are random at startup unless you pass
   `-zeroram`. With `-zeroram`, two launches advanced to the same frame with
-  `run_frames` have identical registers, RAM, VRAM and cycle counts.
-- **Boot takes 3 to 5 seconds** on a typical host. Before typing at BASIC, wait
-  for `READY.` to appear in the text layer (VRAM `$1B000`, 256 bytes per row,
-  the character code at every other byte) or just run frames until it does.
-- **Frame rate.** The emulator targets 60 fps but a slow host may run
-  at 40 to 55. Use `run_frames` and the frame counter from `get_status` rather
-  than wall-clock time. `lag_ms` shows how far emulation is behind real time.
+  `run_frames` have identical registers, RAM, VRAM and cycle counts. `reset` with
+  `zero_ram: true` gets you back to the same kind of start without relaunching;
+  VRAM, banked RAM and all of low RAM except a few stale bytes below the stack
+  pointer then come out identical from run to run.
+- **Timing is paced, even without a window.** Emulated time runs at the normal
+  60 frames per second whether or not there is a window, so `run_frames(60)`
+  takes about a second and 600 frames about ten. Boot to the `READY.` prompt
+  takes under a second windowless (about 36 frames); with a window on a slow
+  host it can take several seconds. Before typing at BASIC, wait for `READY.` in
+  the text layer (VRAM `$1B000`, 256 bytes per row, the character code at every
+  other byte), or run frames until it appears.
+- **Going faster.** `set_warp` (or starting with `-warp`) lifts the speed limit,
+  so frames pass as fast as the host can emulate them, around twice real time or
+  more on the development host. This works for free-running emulation and for
+  `run_frames`, which checks its target once per frame rather than after every
+  instruction.
+- **Measure in emulated time.** Use `run_frames`, the frame counter and the
+  `cycles` field (exact CPU cycles, in `get_registers`, `get_status` and every
+  stop result) rather than wall-clock time. `lag_ms` in `get_status` shows how far
+  emulation is behind real time on a slow host.
 
 ## Tools
 
@@ -150,10 +170,12 @@ returns a PNG image.
 
 | Tool | Arguments | What it does |
 |---|---|---|
-| `get_registers` | none | pc, a, x, y, sp, status, current RAM and ROM bank, paused flag |
-| `get_status` | none | frames, cycle count at last frame, clock in MHz, warp, `lag_ms`, paused, state, number of breakpoints |
-| `read_memory` | `address`\*, `space`, `count`, `bank` | Reads up to 131072 bytes without side effects (I/O is not triggered). `space` is `cpu` (default; `$A000-$BFFF` banked RAM, `$C000-$FFFF` banked ROM, using the current banks unless `bank` is given) or `vram` (the 128 KB VERA space, including palette at `0x1FA00` and sprite attributes at `0x1FC00`). Returns one lowercase hex string. |
-| `get_screen` | none | 640x480 PNG of the current framebuffer |
+| `get_registers` | none | pc, a, x, y, sp, status, current RAM and ROM bank, paused flag, and `cycles`: the exact number of CPU clock cycles executed since start. Subtract two values to measure what a routine costs. |
+| `get_status` | none | frames, `cycles`, cycle count at the last frame, clock in MHz, warp, `lag_ms`, paused, state, number of breakpoints |
+| `read_memory` | `address`\*, `space`, `count`, `bank` | Reads up to 131072 bytes without side effects (I/O is not triggered). `space` is `cpu` (default; `$A000-$BFFF` banked RAM, `$C000-$FFFF` banked ROM, using the current banks unless `bank` is given) or `vram` (the 128 KB VERA space, including palette at `0x1FA00` and sprite attributes at `0x1FC00`). Returns one lowercase hex string. With `path`, the raw bytes are written to that host file instead and only the byte count is returned, which keeps large buffers (a 38,400-byte frame buffer is about 77 KB as hex) out of the conversation. An existing file is replaced only with `overwrite: true`. |
+| `hash_memory` | `address`\*, `count`\*, `space`, `bank`, `algorithm` | CRC32 and/or SHA-256 (`algorithm`: `crc32`, `sha256` or `both`, the default) of a range, read like `read_memory`. Compare a buffer against a known value without transferring it. The CRC32 is the standard one (`zlib.crc32`). |
+| `get_vera_state` | none | VERA's internal state, which the registers at `$9F20-$9F3F` do not show: both data ports at once (address, signed step, increment field, prefetched byte, nibble flags), `addrsel` and `dcsel`, the IRQ enable and status bits, the line-compare value and whether IRQ is asserted, the current raster line, and the FX state (mode, flags, the four cache bytes as hex, pixel increments and positions as decimals plus `_raw` hex, polygon length, affine bases, multiplier accumulator). Reading has no side effects. |
+| `get_screen` | `path`, `overwrite` | 640x480 PNG of the current framebuffer. With `path` it is written to that host file instead of being returned. |
 
 ### Run control
 
@@ -169,7 +191,7 @@ the emulator stopped:
 
 ```json
 {"stopped":"breakpoint","pc":"0xC1C6","frames":212,"ram_bank":1,"rom_bank":0,
- "a":"0x00","x":"0x01","y":"0x08","sp":"0x01EE","status":"0x32","breakpoint":1}
+ "cycles":28491203,"a":"0x00","x":"0x01","y":"0x08","sp":"0x01EE","status":"0x32","breakpoint":1}
 ```
 
 A watchpoint stop adds `watchpoint`, `access`, `address`, `value` and
@@ -207,8 +229,46 @@ Watchpoint limits to know about:
 |---|---|---|
 | `write_memory` | `address`\*, `hex`\*, `space`, `bank` | Writes bytes given as hex (`"A9 01 8D 00 04"`). `cpu` space goes through the normal write path, so I/O registers have their usual side effects, but it takes no emulated time and does not trigger watchpoints. ROM (`$C000` and up) is rejected. `bank` selects the RAM bank for `$A000-$BFFF`. `vram` space writes the VERA address space directly. |
 | `set_registers` | any of `pc`, `a`, `x`, `y`, `sp`, `status`, `ram_bank`, `rom_bank` | Paused only. Setting `pc` also ends a WAI/STP wait. A breakpoint at the new `pc` fires when you resume. |
+| `reset` | `zero_ram` | Resets the machine as if the reset button were pressed: the CPU restarts at the reset vector, VERA, the VIAs and the input queues are reset, and text still waiting to be typed is dropped. RAM keeps its contents, as on real hardware, unless `zero_ram: true`, which zeroes RAM and banked RAM and refills VRAM as at a fresh `-zeroram` start. A paused emulator stays paused at the reset vector. Breakpoints, watchpoints and the frame and cycle counters are kept. |
+| `set_warp` | `enabled`\* | Turns warp mode on or off. In warp mode the emulator is not held to real time, so frames pass as fast as the host can emulate them. Behaviour is unchanged; only the speed limiter is bypassed. |
 | `send_key` | `key`\*, `action`, `hold_frames`, `timeout_ms` | Sends a key to the emulated PS/2 keyboard. `key` is an [SDL key name](https://wiki.libsdl.org/SDL2/SDL_Scancode) (`Return`, `A`, `Space`, `Left`, `F5`, `Left Shift`, ...). `action` is `tap` (default), `down` or `up`. `hold_frames` keeps a tapped key down for that many frames; use it for programs that poll key state (needs the emulator running). |
 | `type_text` | `text`\*, `wait`, `timeout_ms` | Types into the KERNAL keyboard buffer. `\n` is Enter. If the emulator is paused the text is queued and typed after `continue`. With `wait: true` it returns when everything is typed, not when the program it started finishes. |
+
+`type_text` is the easy way to enter BASIC lines and commands. Programs that
+read the keyboard directly bypass the KERNAL buffer; use `send_key` for those.
+
+### Load a program
+
+Puts a program on the machine without going through the (emulated) disk drive.
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `load_prg` | `path`\*, `address`, `raw`, `bank`, `run` | Loads a PRG file from the host into memory, instantly and without emulated time. The first two bytes of the file are the load address, as with the KERNAL's `LOAD`; `address` overrides it, and `raw: true` treats the whole file as data (`address` required). `bank` selects the RAM bank for loads at `$A000` and up, and data that runs past `$BFFF` continues in the next bank, like the KERNAL. With `run: true` the emulator types `RUN` (BASIC) or `SYS $addr` (machine code). |
+
+The result gives `start`, `end` (exclusive), `bytes`, whether it looks like BASIC,
+and the `start_command` to use if you did not pass `run`.
+
+- A load at `$0801` is treated as a **BASIC program**. BASIC's end-of-program
+  pointers are updated the way the `LOAD` command does, otherwise BASIC would
+  store variables on top of the program. Those pointers live at ROM-specific
+  addresses; the tool uses the **release 49** layout, assuming later releases
+  keep it. The result names the ROM (`rom_release`, read from `$FF80`: `r49`,
+  `prerelease 48`, or `custom build`) and adds a `warning` when the ROM is
+  detectably **older than r49**, since the pointers may then be at different
+  addresses; if a program misbehaves there, load it with `LOAD` instead. A
+  custom build (`$FF`) cannot be placed on that scale and gets no warning.
+- If BASIC's start-of-program pointer is not where it should be (the ROM has not
+  finished booting, or the layout differs), the pointers are not set, the result
+  says `basic_pointers: "not set (...)"`, and `run: true` is refused for BASIC
+  programs. Wait for the `READY.` prompt and try again.
+- `run: true` types `RUN` or `SYS` into the KERNAL keyboard buffer, so it needs
+  the emulator running at the BASIC prompt. If the emulator is paused the command
+  is queued, exactly like `type_text`, and typed after `continue`. Loading over a
+  program that is running will crash it, as it would on real hardware.
+- Loads that would overwrite I/O (`$9F00-$9FFF`) or run into ROM are rejected,
+  and nothing is changed when a load is rejected. Files up to 1 MB are read.
+- The path is on the machine running the emulator; relative paths are relative
+  to the emulator's working directory, so absolute paths are safest.
 
 ### Mouse
 
@@ -241,34 +301,6 @@ How the mouse works on the X16, and what that means for these tools:
 - Moving the real mouse over the emulator window at the same time mixes with
   the injected input.
 
-`load_prg` puts a program on the machine without going through the (emulated)
-disk drive:
-
-| Tool | Arguments | What it does |
-|---|---|---|
-| `load_prg` | `path`\*, `address`, `raw`, `bank`, `run` | Loads a PRG file from the host into memory, instantly and without emulated time. The first two bytes of the file are the load address, as with the KERNAL's `LOAD`; `address` overrides it, and `raw: true` treats the whole file as data (`address` required). `bank` selects the RAM bank for loads at `$A000` and up, and data that runs past `$BFFF` continues in the next bank, like the KERNAL. With `run: true` the emulator types `RUN` (BASIC) or `SYS $addr` (machine code). |
-
-The result gives `start`, `end` (exclusive), `bytes`, whether it looks like BASIC,
-and the `start_command` to use if you did not pass `run`.
-
-- A load at `$0801` is treated as a **BASIC program**. BASIC's end-of-program
-  pointers are updated the way the `LOAD` command does, otherwise BASIC would
-  store variables on top of the program. Those pointers live at ROM-specific
-  addresses, so this is done only for ROM releases the tool knows (currently
-  R49). On any other release the result says `basic_pointers: "not set"` and
-  `run: true` is refused for BASIC programs; load without `run` and start it by
-  hand, or use `type_text` with `LOAD`.
-- `run: true` types into the KERNAL keyboard buffer, so it needs the emulator
-  running at the BASIC prompt. Loading over a program that is running will
-  crash it, as it would on real hardware.
-- Loads that would overwrite I/O (`$9F00-$9FFF`) or run into ROM are rejected,
-  and nothing is changed when a load is rejected. Files up to 1 MB are read.
-- The path is on the machine running the emulator; relative paths are relative
-  to the emulator's working directory, so absolute paths are safest.
-
-`type_text` is the easy way to enter BASIC lines and commands. Programs that
-read the keyboard directly bypass the KERNAL buffer; use `send_key` for those.
-
 (\* = required)
 
 ## Example session
@@ -298,9 +330,8 @@ To test a small routine without a build step:
 ## Limitations
 
 - No watchpoints on VRAM addresses, no data-dependent conditions on breakpoints.
-- `load_prg` knows BASIC's pointer layout only for the ROM releases listed in
-  `basic_layouts` in `src/mcp_tools.c`; other releases load fine but need the
-  BASIC program started by hand.
+- `load_prg` assumes the release 49 layout of BASIC's pointers (see above), and
+  warns on ROMs detectably older than that.
 - No audio inspection, and no joystick input.
 - Requests are handled serially (see above).
 - Closing the emulator window ends the session (a `-nowindow` emulator has none; it ends when the client closes it).
@@ -342,6 +373,7 @@ has the helpers (`Emu`, `check`, `wait_screen`, ...).
 | `src/mcp_tools.c` | The tool implementations and the tool table |
 | `src/mcp_debug.c` | Breakpoints, watchpoints, stepping and stop state |
 | `src/mcp_json.c` | The JSON parser and writer |
+| `src/mcp_hash.c` | SHA-256 for `hash_memory` (CRC32 comes from zlib) |
 
 A thread reads and parses requests; each `tools/call` becomes a job that the
 **emulator thread** runs at the top of `emulator_loop`, so tools can touch
