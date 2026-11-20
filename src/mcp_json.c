@@ -506,3 +506,25 @@ json_buf_append_scalar(json_buf *b, const json_node *node)
 			json_buf_append(b, "null");
 	}
 }
+
+void
+json_buf_append_base64(json_buf *b, const unsigned char *data, size_t n)
+{
+	static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	buf_reserve(b, (n + 2) / 3 * 4);
+	char *o = b->data + b->len;
+	size_t i = 0;
+	for (; i + 2 < n; i += 3) {
+		unsigned v = (unsigned)data[i] << 16 | (unsigned)data[i + 1] << 8 | data[i + 2];
+		*o++ = tbl[v >> 18]; *o++ = tbl[(v >> 12) & 63]; *o++ = tbl[(v >> 6) & 63]; *o++ = tbl[v & 63];
+	}
+	if (n - i == 1) {
+		unsigned v = (unsigned)data[i] << 16;
+		*o++ = tbl[v >> 18]; *o++ = tbl[(v >> 12) & 63]; *o++ = '='; *o++ = '=';
+	} else if (n - i == 2) {
+		unsigned v = (unsigned)data[i] << 16 | (unsigned)data[i + 1] << 8;
+		*o++ = tbl[v >> 18]; *o++ = tbl[(v >> 12) & 63]; *o++ = tbl[(v >> 6) & 63]; *o++ = '=';
+	}
+	b->len = (size_t)(o - b->data);
+	b->data[b->len] = 0;
+}

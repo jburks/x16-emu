@@ -8,6 +8,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include "mcp_json.h"
 
 // A tool call in flight. Created by the reader thread, run on the EMULATOR
@@ -23,7 +24,10 @@ typedef struct mcp_job {
 
 	// Result, filled in by run():
 	bool is_error;          // tool execution error (the model sees the text)
-	json_buf text;          // result text
+	json_buf text;          // result text (may be empty if there is an image)
+	uint8_t *image;         // optional image result, malloc'd; the job frees it
+	size_t image_len;
+	const char *image_mime; // e.g. "image/png"
 
 	// Completion handshake, protected by the queue lock in mcp.c
 	bool done;

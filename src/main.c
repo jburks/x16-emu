@@ -1606,7 +1606,13 @@ emulator_loop(void *param)
 {
 	uint32_t old_clockticks6502 = clockticks6502;
 	for (;;) {
-		if (mcp_enabled) mcp_service();
+		if (mcp_enabled) {
+			mcp_service();
+			if (mcp_is_paused()) {
+				if (!mcp_idle_while_paused()) break;
+				continue;
+			}
+		}
 
 		if (smc_requested_reset) machine_reset();
 

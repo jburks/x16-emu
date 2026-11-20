@@ -149,15 +149,29 @@ send_result(const char *id_json, const char *result_json)
 	json_buf_free(&b);
 }
 
-// A tools/call result: one text content item.
+// A tools/call result: an optional text item, then an optional image item.
 static void
-send_tool_result(const char *id_json, const char *text, size_t len, bool is_error)
+send_tool_result(const char *id_json, const char *text, size_t len, bool is_error,
+                 const uint8_t *image, size_t image_len, const char *image_mime)
 {
 	json_buf r;
 	json_buf_init(&r);
-	json_buf_append(&r, "{\"content\":[{\"type\":\"text\",\"text\":");
-	json_buf_append_string(&r, text, len);
-	json_buf_append(&r, is_error ? "}],\"isError\":true}" : "}],\"isError\":false}");
+	json_buf_append(&r, "{\"content\":[");
+	bool any = false;
+	if (len > 0 || !image) {
+		json_buf_append(&r, "{\"type\":\"text\",\"text\":");
+		json_buf_append_string(&r, text, len);
+		json_buf_append(&r, "}");
+		any = true;
+	}
+	if (image) {
+		json_buf_append(&r, any ? ",{\"type\":\"image\",\"data\":\"" : "{\"type\":\"image\",\"data\":\"");
+		json_buf_append_base64(&r, image, image_len);
+		json_buf_append(&r, "\",\"mimeType\":");
+		json_buf_append_string(&r, image_mime, strlen(image_mime));
+		json_buf_append(&r, "}");
+	}
+	json_buf_append(&r, is_error ? "],\"isError\":true}" : "],\"isError\":false}");
 	send_result(id_json, r.data);
 	json_buf_free(&r);
 }
@@ -168,6 +182,7 @@ static void
 job_free(mcp_job *job)
 {
 	json_buf_free(&job->text);
+	free(job->image);
 	json_free(job->msg);
 	free(job);
 }
@@ -238,6 +253,45 @@ mcp_service(void)
 	SDL_UnlockMutex(queue_lock);
 }
 
+// ---- pause ----
+
+extern uint32_t sdlTicks_base; // timing.c: wall-clock origin of the speed limiter
+
+static bool paused;
+static uint32_t pause_started;
+
+bool
+mcp_is_paused(void)
+{
+	return paused;
+}
+
+void
+mcp_set_paused(bool p)
+{
+	if (p == paused) {
+		return;
+	}
+	if (p) {
+		pause_started = SDL_GetTicks();
+	} else {
+		// The speed limiter compares emulated time with wall-clock time since
+		// start. Move the origin forward by the time we were paused, or the
+		// emulator would run flat out until it had "caught up".
+		sdlTicks_base += SDL_GetTicks() - pause_started;
+	}
+	paused = p;
+}
+
+bool
+mcp_idle_while_paused(void)
+{
+	SDL_Delay(2);
+	SDL_PumpEvents();
+	SDL_Event ev;
+	return SDL_PeepEvents(&ev, 1, SDL_GETEVENT, SDL_QUIT, SDL_QUIT) == 0;
+}
+
 static unsigned
 default_timeout_ms(void)
 {
@@ -284,12 +338,13 @@ run_tool(const char *id_json, const mcp_tool *tool, json_node *msg)
 		char text[160];
 		snprintf(text, sizeof(text), "tool %.80s timed out after %u ms (is the emulator paused or stuck?)",
 		         tool->name, timeout);
-		send_tool_result(id_json, text, strlen(text), true);
+		send_tool_result(id_json, text, strlen(text), true, NULL, 0, NULL);
 		return;
 	}
 	SDL_UnlockMutex(queue_lock);
 
-	send_tool_result(id_json, job->text.data ? job->text.data : "", job->text.len, job->is_error);
+	send_tool_result(id_json, job->text.data ? job->text.data : "", job->text.len, job->is_error,
+	                 job->image, job->image_len, job->image_mime);
 	job_free(job);
 }
 

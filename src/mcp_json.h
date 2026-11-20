@@ -51,6 +51,8 @@ void json_buf_append(json_buf *b, const char *s);
 void json_buf_append_n(json_buf *b, const char *s, size_t n);
 // Appends s as a quoted, escaped JSON string.
 void json_buf_append_string(json_buf *b, const char *s, size_t n);
+// Appends the standard base64 encoding (with padding) of data.
+void json_buf_append_base64(json_buf *b, const unsigned char *data, size_t n);
 // Appends a scalar node (null/bool/number/string) as JSON. Other types append "null".
 void json_buf_append_scalar(json_buf *b, const json_node *node);
 

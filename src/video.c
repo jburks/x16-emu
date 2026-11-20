@@ -581,6 +581,19 @@ screenshot(void)
 }
 #endif
 
+// Encodes the current framebuffer as a 640x480 RGB PNG into a malloc'd buffer
+// (free() it). Returns NULL on failure. Used by the MCP server.
+uint8_t *
+video_get_png(int *len)
+{
+	for (int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
+		png_buffer[(i*3)+0] = framebuffer[(i*4)+2];
+		png_buffer[(i*3)+1] = framebuffer[(i*4)+1];
+		png_buffer[(i*3)+2] = framebuffer[(i*4)+0];
+	}
+	return stbi_write_png_to_mem(png_buffer, SCREEN_WIDTH * 3, SCREEN_WIDTH, SCREEN_HEIGHT, 3, len);
+}
+
 struct video_sprite_properties sprite_properties[128];
 
 static void

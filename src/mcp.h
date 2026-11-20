@@ -22,4 +22,14 @@ void mcp_start(void);
 // queued tool calls. Costs one atomic read when there is nothing to do.
 void mcp_service(void);
 
+// Pause state. The tools run on the emulator thread, so these are only used from
+// there. While paused, emulator_loop does not execute instructions, but still
+// calls mcp_service().
+bool mcp_is_paused(void);
+void mcp_set_paused(bool paused);
+// Called by emulator_loop instead of running an instruction while paused.
+// Sleeps briefly and pumps window events. Returns false if the user closed the
+// window (or the client disconnected), meaning the loop should exit.
+bool mcp_idle_while_paused(void);
+
 #endif
