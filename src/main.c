@@ -515,6 +515,11 @@ usage()
 	printf("\tSet the real-time-clock to the current system time and date.\n");
 	printf("-via2\n");
 	printf("\tInstall the second VIA chip expansion at $9F10\n");
+	printf("-nowindow\n");
+	printf("\tRun without a window or sound (SDL dummy video and audio drivers).\n");
+	printf("\tThe machine is still fully emulated, so it works with -mcp for\n");
+	printf("\tbackground use and needs no display server. No keyboard or mouse\n");
+	printf("\tinput reaches it except through -mcp.\n");
 	printf("-mcp\n");
 	printf("\tRun as an MCP (Model Context Protocol) server over stdin/stdout.\n");
 	printf("\tstdout carries only protocol messages; all other output goes to\n");
@@ -1112,6 +1117,13 @@ main(int argc, char **argv)
 				exit(1);
 			}
 			mcp_enable();
+		} else if (!strcmp(argv[0], "-nowindow")) {
+			argc--;
+			argv++;
+			// SDL's dummy drivers: no window, no focus stealing, no sound, no display server needed.
+			// Video is still fully emulated (VRAM, framebuffer, frame timing).
+			SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+			SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
 		} else if (!strcmp(argv[0], "-testbench")){
 			if (mcp_enabled) {
 				fprintf(stderr, "-mcp and -testbench cannot be combined\n");

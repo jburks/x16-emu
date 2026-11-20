@@ -14,14 +14,14 @@ x16emu -mcp
 ```
 
 All the usual options still work (`-rom`, `-sdcard`, `-prg`, `-run`, `-zeroram`,
-`-warp`, ...), except `-testbench`, which cannot be combined with `-mcp`.
+`-warp`, `-nowindow`, ...), except `-testbench`, which cannot be combined with `-mcp`.
 
 ## Attaching an agent
 
 The server uses the **stdio** transport: the client starts the emulator as a
 child process and talks to it over the pipe, newline-delimited JSON-RPC 2.0. You
 do not start the emulator yourself; you tell your client how to launch it. The
-emulator needs a display, because the window is real.
+emulator needs a display unless you pass `-nowindow` (see below), because the window is real.
 
 ### Claude Code
 
@@ -50,6 +50,24 @@ Most clients take a JSON block like this in their MCP settings file:
 Use an absolute path for `command`. If the emulator cannot find `rom.bin`, add
 `"-rom", "/path/to/rom.bin"` to `args`; by default it looks next to the
 executable.
+
+### Running in the background (no window)
+
+By default the emulator opens a window, which can pop up in front of what you
+are doing. Add `-nowindow` to run without one:
+
+```
+claude mcp add x16 -- /path/to/x16emu -mcp -nowindow -zeroram
+```
+
+`-nowindow` selects SDL's dummy video and audio drivers. There is no window, no
+focus stealing and no sound, and it needs no display server at all, so it also
+works over SSH, in containers and in CI. The machine is still emulated in full:
+video is rendered, the frame counter and timing work, and `get_screen`,
+`read_memory` of VRAM, the keyboard and mouse tools behave exactly as with a
+window. The only things you lose are the ones you would see and hear yourself.
+(The flag is not specific to MCP, but without `-mcp` nothing can reach the
+emulator.)
 
 ### Scripting it directly
 
@@ -259,7 +277,7 @@ To test a small routine without a build step:
   command line, or use `type_text` with `LOAD`.
 - No audio inspection, and no joystick input.
 - Requests are handled serially (see above).
-- The emulator window must stay open: closing it ends the session.
+- Closing the emulator window ends the session (a `-nowindow` emulator has none; it ends when the client closes it).
 
 ## For emulator developers
 
