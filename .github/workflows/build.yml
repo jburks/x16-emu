@@ -373,7 +373,7 @@ jobs:
           path: emu_binaries/*
   build-macos-arm64:
     needs: [README]
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Install Dependencies
