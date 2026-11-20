@@ -7,7 +7,7 @@
 BUILD_DIR = build
 BUILD_TYPE ?= Release
 
-.PHONY: all clean distclean
+.PHONY: all clean distclean mcp-test
 
 all:
 	@cmake -E echo "Building with CMake"
@@ -21,3 +21,8 @@ clean:
 
 distclean:
 	cmake -E remove_directory $(BUILD_DIR)
+
+# Builds the emulator, then runs the MCP server tests (windowless, so nothing pops up).
+# Needs rom.bin next to the emulator in $(BUILD_DIR).
+mcp-test: all
+	cmake --build $(BUILD_DIR) --target mcp-test

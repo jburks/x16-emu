@@ -360,3 +360,16 @@ message(STATUS "================================================================
 message(STATUS "   Fluidsynth Support : ${FLUID_EN_MSG}")
 message(STATUS "   Trace Support      : ${TRACE_EN_MSG}")
 message(STATUS "=========================================================================\n")
+
+# Regression tests for the MCP server (tests/mcp). They run the emulator windowless (-nowindow).
+# Build and run with: make mcp-test
+if(NOT EMSCRIPTEN)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND)
+        add_custom_target(mcp-test
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/mcp/run_all.py $<TARGET_FILE:x16emu>
+            DEPENDS x16emu
+            USES_TERMINAL
+            COMMENT "Running the MCP server tests")
+    endif()
+endif()

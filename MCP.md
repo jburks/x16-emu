@@ -279,6 +279,35 @@ To test a small routine without a build step:
 - Requests are handled serially (see above).
 - Closing the emulator window ends the session (a `-nowindow` emulator has none; it ends when the client closes it).
 
+## Running the tests
+
+The regression tests live in `tests/mcp/`. They start the emulator as a real MCP
+client would and check the protocol, every tool, and the run-control semantics
+(determinism, breakpoints, watchpoints, timeouts).
+
+```
+make mcp-test
+```
+
+builds the emulator and runs them. They always run with `-nowindow`, so no
+windows pop up and no display is needed; set `X16EMU_TEST_WINDOW=1` to get a
+window when debugging a test. The ROM is the `rom.bin` next to the executable
+(`build/rom.bin`), or `X16EMU_ROM`. A full run takes about a minute.
+
+To run them directly, or a subset:
+
+```
+python3 tests/mcp/run_all.py build/x16emu            # all, with a summary
+python3 tests/mcp/run_all.py build/x16emu -v mouse   # only test_mouse.py, every check
+python3 tests/mcp/test_debug.py build/x16emu         # one script on its own
+```
+
+The `testbench/` directory is a different mechanism (the emulator's
+`-testbench` mode) and cannot be combined with `-mcp`.
+
+New tools should come with checks in the matching `test_*.py`; `mcp_testlib.py`
+has the helpers (`Emu`, `check`, `wait_screen`, ...).
+
 ## For emulator developers
 
 | File | Contents |
