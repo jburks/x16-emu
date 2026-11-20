@@ -53,6 +53,7 @@ typedef struct {
 	uint32_t length;
 	int bank;
 	int access;
+	bool exclude_fetch;
 	unsigned hits;
 } watch_t;
 static watch_t watches[MCP_MAX_WATCHPOINTS];
@@ -183,11 +184,11 @@ mcp_step_begin(uint32_t n)
 }
 
 int
-mcp_watch_add(int space, uint32_t address, uint32_t length, int bank, int access, bool *existed)
+mcp_watch_add(int space, uint32_t address, uint32_t length, int bank, int access, bool exclude_fetch, bool *existed)
 {
 	for (int i = 0; i < watch_total; i++) {
 		if (watches[i].space == space && watches[i].address == address && watches[i].length == length
-		    && watches[i].bank == bank && watches[i].access == access) {
+		    && watches[i].bank == bank && watches[i].access == access && watches[i].exclude_fetch == exclude_fetch) {
 			*existed = true;
 			return watches[i].id;
 		}
@@ -203,6 +204,7 @@ mcp_watch_add(int space, uint32_t address, uint32_t length, int bank, int access
 	w->length = length;
 	w->bank = bank;
 	w->access = access;
+	w->exclude_fetch = exclude_fetch;
 	w->hits = 0;
 	recount_watches();
 	return w->id;
@@ -237,7 +239,7 @@ mcp_watch_total(void)
 
 bool
 mcp_watch_get(int index, int *id, int *space, uint32_t *address, uint32_t *length, int *bank, int *access,
-              unsigned *hits)
+              bool *exclude_fetch, unsigned *hits)
 {
 	if (index < 0 || index >= watch_total) {
 		return false;
@@ -248,6 +250,7 @@ mcp_watch_get(int index, int *id, int *space, uint32_t *address, uint32_t *lengt
 	*length = watches[index].length;
 	*bank = watches[index].bank;
 	*access = watches[index].access;
+	*exclude_fetch = watches[index].exclude_fetch;
 	*hits = watches[index].hits;
 	return true;
 }
@@ -277,13 +280,16 @@ mcp_watch_hit(uint16_t address, bool write, uint8_t value)
 		return;
 	}
 	int want = write ? WATCH_WRITE : WATCH_READ;
+	// A read of one of the bytes of the instruction being executed (its opcode and operands, at most 4 bytes
+	// on the 65C816) is an instruction fetch. Only a read of the instruction's own bytes as data is misjudged.
+	bool fetch = !write && (uint16_t)(address - opcode_addr) < 4;
 	for (int i = 0; i < watch_total; i++) {
 		watch_t *w = &watches[i];
 		if (w->space != WATCH_SPACE_CPU) {
 			continue;
 		}
 		if ((w->access & want) && (uint32_t)address >= w->address && (uint32_t)address - w->address < w->length
-		    && bank_ok(w->bank, address)) {
+		    && bank_ok(w->bank, address) && !(fetch && w->exclude_fetch)) {
 			w->hits++;
 			record_hit(w, address, write, value, -1);
 			return;

@@ -1,4 +1,4 @@
-"""VRAM write watchpoints."""
+"""VRAM write watchpoints, and exclude_fetch for CPU read watchpoints."""
 import json, sys, time
 from mcp_testlib import *
 
@@ -31,7 +31,7 @@ r = cont()
 check("hit on the store to $0A001: space, address, value, port, accessing_pc", r["stopped"] == "watchpoint" and r["space"] == "vram" and r["address"] == "0x0A001"
       and r["value"] == "0x22" and r["data_port"] == 0 and r["accessing_pc"] == "0x061B" and r["pc"] == "0x061E", r)
 check("the first store ($0A000) did not trigger it, and the byte is in VRAM", e.ok("read_memory", {"space": "vram", "address": 0xA000, "count": 2})["hex"] == "1122")
-lst = e.ok("list_watchpoints"); check("list_watchpoints shows space vram and a hit", lst[0]["space"] == "vram" and lst[0]["hits"] == 1, lst)
+lst = e.ok("list_watchpoints"); check("list_watchpoints shows space vram and a hit", lst[0]["space"] == "vram" and lst[0]["hits"] == 1 and lst[0]["exclude_fetch"] is False, lst)
 check("state is 'watchpoint'", e.status()["state"] == "watchpoint")
 
 # a range: the first store in it is reported
@@ -79,11 +79,40 @@ r = cont(); check("...while the byte that is written still fires", r["stopped"] 
 # ---- argument validation ----
 for label, a in (("a read watch on vram", {"space": "vram", "address": 0, "access": "read"}), ("readwrite on vram", {"space": "vram", "address": 0, "access": "readwrite"}),
                  ("a bank with vram", {"space": "vram", "address": 0, "bank": 1}), ("address past VRAM", {"space": "vram", "address": 0x20000}),
-                 ("a range past VRAM", {"space": "vram", "address": 0x1FFFF, "length": 2}),
+                 ("a range past VRAM", {"space": "vram", "address": 0x1FFFF, "length": 2}), ("exclude_fetch with vram", {"space": "vram", "address": 0, "exclude_fetch": True}),
+                 ("exclude_fetch on a write watch", {"address": 0x10, "exclude_fetch": True}), ("exclude_fetch not a boolean", {"address": 0x10, "access": "read", "exclude_fetch": "yes"}),
                  ("an unknown space", {"space": "rom", "address": 0})):
     err, t = e.call("set_watchpoint", a); check("set_watchpoint rejects " + label, err, t)
 err, t = e.call("set_watchpoint", {"space": "vram", "address": 0, "access": "read"}); check("the vram-read refusal explains why (prefetch)", "prefetch" in t, t)
 e.ok("clear_watchpoint", {"all": True})
 
+# ---- exclude_fetch ----
+# 0600: LDA $0608 | 0603: JMP $0600 | 0606,0607: NOP NOP | 0608: data $55
+prog(0x0600, "AD0806 4C0006 EAEA 55")
+w = e.ok("set_watchpoint", {"address": 0x0600, "length": 9, "access": "read"}); run_from(0x0600)
+r = cont(); check("a read watch over code and data fires on the first instruction fetch ($0600)", r["address"] == "0x0600" and r["accessing_pc"] == "0x0600", r)
+e.ok("clear_watchpoint", {"all": True})
+w = e.ok("set_watchpoint", {"address": 0x0600, "length": 9, "access": "read", "exclude_fetch": True})
+check("set_watchpoint echoes exclude_fetch", w["exclude_fetch"] is True, w)
+run_from(0x0600); r = cont()
+check("with exclude_fetch only the data read fires: $0608 read by the LDA at $0600", r["stopped"] == "watchpoint" and r["address"] == "0x0608"
+      and r["value"] == "0x55" and r["accessing_pc"] == "0x0600" and r["access"] == "read", r)
+check("list_watchpoints shows exclude_fetch", e.ok("list_watchpoints")[0]["exclude_fetch"] is True)
+e.ok("clear_watchpoint", {"all": True})
+# watching the code only: nothing but fetches, so exclude_fetch means it never fires
+e.ok("set_watchpoint", {"address": 0x0600, "length": 8, "access": "read", "exclude_fetch": True}); run_from(0x0600)
+r = e.ok("run_frames", {"frames": 3, "timeout_ms": 20000}); check("exclude_fetch: a read watch over code that only executes never fires", r["stopped"] == "frames", r)
+e.ok("clear_watchpoint", {"all": True})
+
+# ---- no dummy reads: one instruction, one read ----
+prog(0x0700, "E610 EA"); e.ok("write_memory", {"address": 0x10, "hex": "00"})
+e.ok("set_watchpoint", {"address": 0x10, "access": "read"}); e.ok("set_registers", {"pc": 0x0700, "status": 0x24})
+r = e.ok("step"); h = e.ok("list_watchpoints")[0]["hits"]
+check("INC $10 (a read-modify-write) is one read access, not two (hits=%d)" % h, r["stopped"] == "watchpoint" and h == 1, (r, h))
+e.ok("clear_watchpoint", {"all": True})
+prog(0x0710, "BDFF03 EA"); e.ok("set_registers", {"pc": 0x0710, "x": 1})
+e.ok("set_watchpoint", {"address": 0x03FF, "length": 2, "access": "read", "exclude_fetch": True})
+r = e.ok("step"); h = e.ok("list_watchpoints")[0]["hits"]
+check("LDA $03FF,X across a page boundary is one data read (hits=%d)" % h, r["stopped"] == "watchpoint" and r["address"] == "0x0400" and h == 1, (r, h))
 check("emulator exits cleanly", e.close() == 0)
 finish()

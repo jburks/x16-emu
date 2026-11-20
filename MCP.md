@@ -293,9 +293,9 @@ A watchpoint stop adds `watchpoint`, `access`, `address`, `value` and
 | `set_breakpoint` | `address`\*, `bank` | Pauses just before the instruction at `address` executes. From `$A000` up, `bank` restricts it to that RAM bank (`$A000-$BFFF`) or ROM bank (`$C000-$FFFF`); without it the breakpoint matches in any bank. Max 64. Returns the id (the existing one if already set). |
 | `clear_breakpoint` | `id` or `all` | Removes one or all |
 | `list_breakpoints` | none | Ids, addresses, banks and hit counts |
-| `set_watchpoint` | `address`\*, `length`, `access`, `bank`, `space` | Pauses after an instruction that accesses the range. `space` is `cpu` (default) or `vram`. For `cpu`, `access` is `read`, `write` (default) or `readwrite`. For `vram` only writes are watched. Max 32 watchpoints in all. |
+| `set_watchpoint` | `address`\*, `length`, `access`, `bank`, `space`, `exclude_fetch` | Pauses after an instruction that accesses the range. `space` is `cpu` (default) or `vram`. For `cpu`, `access` is `read`, `write` (default) or `readwrite`, and `exclude_fetch` ignores instruction fetches. For `vram` only writes are watched. Max 32 watchpoints in all. |
 | `clear_watchpoint` | `id` or `all` | Removes one or all |
-| `list_watchpoints` | none | Ids, spaces, ranges, access types, banks and hit counts |
+| `list_watchpoints` | none | Ids, spaces, ranges, access types, banks, `exclude_fetch` flags and hit counts |
 
 Resuming from a breakpoint executes that instruction once without hitting it
 again. Resuming after a watchpoint hit does not re-trigger it.
@@ -307,7 +307,14 @@ again. Resuming after a watchpoint hit does not re-trigger it.
   instruction completes, so `pc` points at the next one. If an instruction
   touches the range more than once, the first access is reported.
 - **Instruction fetches count as reads**, so a read watch on code fires when it
-  executes.
+  executes, and so does a read watch on data that sits next to code. Pass
+  `exclude_fetch: true` to ignore reads of the bytes of the instruction being
+  executed (its opcode and operands). That is a heuristic: it treats a read
+  within four bytes of the opcode's address as a fetch, so the only miss is an
+  instruction that deliberately reads its own bytes as data.
+- The emulator does not issue the extra "dummy" reads that some real 65C02
+  addressing modes make (read-modify-write instructions and page-crossing
+  indexed loads each read once), so none are reported.
 - A write through the VERA data port shows up here as an access to `$9F23` or
   `$9F24`, not as a VRAM address. Use a VRAM watchpoint for that.
 
