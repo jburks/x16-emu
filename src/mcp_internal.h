@@ -43,11 +43,50 @@ typedef struct mcp_tool {
 	// result in job->text / job->is_error is final. A tool that is not done
 	// must return quickly: the emulator is not running while it executes.
 	bool (*run)(mcp_job *job);
-	unsigned timeout_ms;        // 0 = default (X16EMU_MCP_TIMEOUT_MS, else 30000)
+	unsigned timeout_ms;        // 0 = default (X16EMU_MCP_TIMEOUT_MS, else 30000); a call may
+	                            // override it with a numeric "timeout_ms" argument
+	// Optional. Called on the emulator thread when the reader gave up waiting
+	// (timeout) on a job that had started but not finished. Use it to leave the
+	// emulator in a sane state. The job is dropped afterwards.
+	void (*cancel)(mcp_job *job);
 } mcp_tool;
 
 // mcp_tools.c: the registry. Returns a NULL-terminated array.
 const mcp_tool *const *mcp_tool_table(void);
+
+// ---- mcp_debug.c: breakpoints and stop state (emulator thread only) ----
+
+typedef enum {
+	STOP_NONE,        // never stopped, or running since the last resume
+	STOP_PAUSE,       // paused by the pause tool or by a cancelled/timed-out run
+	STOP_BREAKPOINT,
+	STOP_FRAMES       // run_frames completed
+} mcp_stop_reason;
+
+typedef struct {
+	mcp_stop_reason reason;
+	int breakpoint_id;  // valid for STOP_BREAKPOINT
+} mcp_stop_info;
+
+extern mcp_stop_info mcp_last_stop;
+extern int mcp_bp_active; // number of breakpoints; read by mcp_service as a fast guard
+
+#define MCP_MAX_BREAKPOINTS 64
+int mcp_bp_add(uint16_t address, int bank, bool *existed); // bank -1 = any; returns id, or -1 if full
+bool mcp_bp_remove(int id);
+void mcp_bp_clear(void);
+// Iterates breakpoints: pass index 0..; returns false past the end.
+bool mcp_bp_get(int index, int *id, uint16_t *address, int *bank, unsigned *hits);
+// Called every emulator pass while running and breakpoints exist: pauses on a hit.
+void mcp_debug_check(void);
+// Resumes a paused emulator without re-hitting a breakpoint at the current pc.
+void mcp_resume(void);
+// Marks the emulator paused with a reason.
+void mcp_stop(mcp_stop_reason reason);
+// "running", "paused", "breakpoint" or "frames"
+const char *mcp_stop_name(void);
+// {"stopped":"...","pc":"0x....",...} describing the current stop state.
+void mcp_describe_stop(json_buf *out);
 
 // Helpers for tool implementations
 void mcp_job_fail(mcp_job *job, const char *message);  // sets is_error and the text

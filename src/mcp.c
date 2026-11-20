@@ -13,8 +13,9 @@
 // never hang the client.
 //
 // Timeout semantics: if the job has not started when the timeout expires it is
-// dropped and never runs. If it has started it runs to completion, but its
-// result is discarded.
+// dropped and never runs. A job that has started but is not finished (a polled
+// job such as run_frames) is cancelled via its tool's cancel hook and dropped.
+// A job that completes in a single pass cannot time out once it has started.
 
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L // fdopen
@@ -59,6 +60,7 @@ static SDL_cond *queue_cond;
 static mcp_job *pending_head, *pending_tail;
 static mcp_job *active_head, *active_tail;
 static SDL_atomic_t work_flag; // nonzero while pending or active jobs may exist
+static bool paused;            // emulator thread only
 
 // Newest first; the client's version is echoed if we know it.
 static const char *const supported_versions[] = {
@@ -189,12 +191,22 @@ job_free(mcp_job *job)
 
 // Emulator thread: runs queued jobs. Called at the top of every emulator loop
 // pass, so the fast path must stay a single atomic read.
+static void service_jobs(void);
+
 void
 mcp_service(void)
 {
-	if (!SDL_AtomicGet(&work_flag)) {
-		return;
+	if (SDL_AtomicGet(&work_flag)) {
+		service_jobs();
 	}
+	if (mcp_bp_active && !paused) {
+		mcp_debug_check();
+	}
+}
+
+static void
+service_jobs(void)
+{
 
 	// Take over the pending jobs.
 	SDL_LockMutex(queue_lock);
@@ -222,6 +234,20 @@ mcp_service(void)
 	mcp_job *job = active_head;
 	while (job) {
 		mcp_job *next = job->next;
+		SDL_LockMutex(queue_lock);
+		bool gave_up = job->abandoned;
+		SDL_UnlockMutex(queue_lock);
+		if (gave_up) {
+			// The reader timed out. Leave the emulator in a sane state and drop the job.
+			if (job->tool->cancel) {
+				job->tool->cancel(job);
+			}
+			if (prev) prev->next = next; else active_head = next;
+			if (active_tail == job) active_tail = prev;
+			job_free(job);
+			job = next;
+			continue;
+		}
 		bool finished = job->tool->run(job);
 		job->polls++;
 		if (!finished) {
@@ -257,7 +283,6 @@ mcp_service(void)
 
 extern uint32_t sdlTicks_base; // timing.c: wall-clock origin of the speed limiter
 
-static bool paused;
 static uint32_t pause_started;
 
 bool
@@ -319,6 +344,10 @@ run_tool(const char *id_json, const mcp_tool *tool, json_node *msg)
 	json_buf_init(&job->text);
 
 	unsigned timeout = tool->timeout_ms ? tool->timeout_ms : default_timeout_ms();
+	const json_node *to = json_get(job->args, "timeout_ms");
+	if (to && to->type == JSON_NUMBER && to->number >= 1 && to->number <= 600000) {
+		timeout = (unsigned)to->number;
+	}
 	uint64_t deadline = SDL_GetTicks64() + timeout;
 
 	SDL_LockMutex(queue_lock);
@@ -335,8 +364,8 @@ run_tool(const char *id_json, const mcp_tool *tool, json_node *msg)
 	if (!job->done) {
 		job->abandoned = true; // the emulator thread frees it from here on
 		SDL_UnlockMutex(queue_lock);
-		char text[160];
-		snprintf(text, sizeof(text), "tool %.80s timed out after %u ms (is the emulator paused or stuck?)",
+		char text[256];
+		snprintf(text, sizeof(text), "tool %.80s timed out after %u ms (pass a larger timeout_ms if it legitimately needs longer)",
 		         tool->name, timeout);
 		send_tool_result(id_json, text, strlen(text), true, NULL, 0, NULL);
 		return;

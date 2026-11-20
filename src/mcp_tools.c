@@ -93,15 +93,16 @@ static const mcp_tool tool_get_registers = {
 static bool
 run_get_status(mcp_job *job)
 {
-	char tmp[256];
+	char tmp[320];
 	// How far the emulation is behind wall-clock time, as the speed limiter sees it.
 	// Near 0 or negative: keeping up (and being throttled). Growing: the host cannot
 	// run the emulator at full speed.
 	long long lag_ms = (long long)(SDL_GetTicks() - sdlTicks_base) - cpu_ticks / MHZ / 1000;
 	snprintf(tmp, sizeof(tmp),
-		"{\"frames\":%u,\"cpu_cycles_at_last_frame\":%lld,\"mhz\":%u,\"warp\":%s,\"lag_ms\":%lld,\"paused\":%s}",
+		"{\"frames\":%u,\"cpu_cycles_at_last_frame\":%lld,\"mhz\":%u,\"warp\":%s,\"lag_ms\":%lld,\"paused\":%s,"
+		"\"state\":\"%s\",\"breakpoints\":%d}",
 		frames, (long long)cpu_ticks, (unsigned)MHZ, warp_mode ? "true" : "false", lag_ms,
-		mcp_is_paused() ? "true" : "false");
+		mcp_is_paused() ? "true" : "false", mcp_stop_name(), mcp_bp_active);
 	json_buf_append(&job->text, tmp);
 	return true;
 }
@@ -109,7 +110,7 @@ run_get_status(mcp_job *job)
 static const mcp_tool tool_get_status = {
 	"get_status",
 	"Returns emulator progress: the number of video frames completed since start (about 60 per emulated second), "
-	"the CPU cycle count at the last completed frame, the emulated clock in MHz, warp mode, lag_ms (how far emulation is behind wall-clock time; it grows if the host cannot keep up) and whether paused.",
+	"the CPU cycle count at the last completed frame, the emulated clock in MHz, warp mode, lag_ms (how far emulation is behind wall-clock time; it grows if the host cannot keep up), whether paused, the state (running, paused, breakpoint or frames: why it last stopped) and the number of breakpoints.",
 	"{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
 	run_get_status,
 	0
@@ -233,7 +234,9 @@ static bool
 run_pause(mcp_job *job)
 {
 	bool was = mcp_is_paused();
-	mcp_set_paused(true);
+	if (!was) {
+		mcp_stop(STOP_PAUSE);
+	}
 	char tmp[96];
 	snprintf(tmp, sizeof(tmp), "%s at pc=0x%04X", was ? "already paused" : "paused", regs.pc);
 	json_buf_append(&job->text, tmp);
@@ -249,21 +252,224 @@ static const mcp_tool tool_pause = {
 	0
 };
 
+static void
+cancel_run(mcp_job *job)
+{
+	(void)job;
+	mcp_stop(STOP_PAUSE); // the client gave up: leave the emulator paused and inspectable
+}
+
 static bool
 run_continue(mcp_job *job)
 {
-	bool was = mcp_is_paused();
-	mcp_set_paused(false);
-	json_buf_append(&job->text, was ? "running" : "was not paused; running");
-	return true;
+	const json_node *w = json_get(job->args, "wait");
+	bool wait = w && w->type == JSON_BOOL && w->boolean;
+	if (job->polls == 0) {
+		if (w && w->type != JSON_BOOL) {
+			mcp_job_fail(job, "wait must be true or false");
+			return true;
+		}
+		if (wait && mcp_bp_active == 0) {
+			mcp_job_fail(job, "wait=true needs at least one breakpoint, otherwise it would never return");
+			return true;
+		}
+		bool was = mcp_is_paused();
+		if (was) {
+			mcp_resume();
+		}
+		if (!wait) {
+			json_buf_append(&job->text, was ? "running" : "was not paused; running");
+			return true;
+		}
+		return false;
+	}
+	if (mcp_is_paused()) { // a breakpoint stopped it
+		mcp_describe_stop(&job->text);
+		return true;
+	}
+	return false;
 }
 
 static const mcp_tool tool_continue = {
 	"continue",
-	"Resumes a paused emulator at normal speed.",
-	"{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+	"Resumes a paused emulator at normal speed. With wait=true it does not return until a breakpoint stops the "
+	"emulator (and returns where it stopped); on timeout the emulator is paused. Optional timeout_ms (default 30000, "
+	"max 600000) applies to wait=true.",
+	"{\"type\":\"object\",\"properties\":{\"wait\":{\"type\":\"boolean\",\"default\":false},"
+	"\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600000}},\"additionalProperties\":false}",
 	run_continue,
-	0
+	0,
+	cancel_run
+};
+
+// ---- run_frames ----
+
+static bool
+run_run_frames(mcp_job *job)
+{
+	if (job->polls == 0) {
+		uint32_t n = 1;
+		if (json_get(job->args, "frames") && (!arg_uint(job, "frames", &n) || n < 1 || n > 1000000)) {
+			mcp_job_fail(job, "frames must be an integer from 1 to 1000000");
+			return true;
+		}
+		job->scratch[0] = (uint32_t)(frames + n);
+		if (mcp_is_paused()) {
+			mcp_resume();
+		} else {
+			mcp_last_stop.reason = STOP_NONE;
+		}
+		return false;
+	}
+	if (mcp_is_paused()) { // a breakpoint stopped it before the frames were up
+		mcp_describe_stop(&job->text);
+		return true;
+	}
+	if ((int32_t)(frames - (uint32_t)job->scratch[0]) >= 0) {
+		mcp_stop(STOP_FRAMES);
+		mcp_describe_stop(&job->text);
+		return true;
+	}
+	return false;
+}
+
+static const mcp_tool tool_run_frames = {
+	"run_frames",
+	"Runs the emulator for exactly `frames` video frames (about 1/60 s each; default 1) and then pauses it, so the "
+	"stop point is deterministic: right after the instruction that completed the last frame. Works from paused or "
+	"running. Stops early, still paused, if a breakpoint is hit. Returns where it stopped (stopped is \"frames\" or "
+	"\"breakpoint\"). At roughly 40-60 frames/s, pass a larger timeout_ms (max 600000) for long runs; on timeout the "
+	"emulator is left paused.",
+	"{\"type\":\"object\",\"properties\":{\"frames\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000000,\"default\":1},"
+	"\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600000}},\"additionalProperties\":false}",
+	run_run_frames,
+	0,
+	cancel_run
+};
+
+// ---- breakpoints ----
+
+static bool
+run_set_breakpoint(mcp_job *job)
+{
+	uint32_t address, bank = 0;
+	if (!arg_uint(job, "address", &address) || address > 0xFFFF) {
+		mcp_job_fail(job, "address is required: 0 to 0xFFFF as an integer or a string like \"0xC000\" or \"$C000\"");
+		return true;
+	}
+	int b = -1;
+	if (json_get(job->args, "bank")) {
+		if (!arg_uint(job, "bank", &bank) || bank > 255) {
+			mcp_job_fail(job, "bank must be an integer from 0 to 255");
+			return true;
+		}
+		if (address < 0xA000) {
+			mcp_job_fail(job, "bank only applies to addresses from $A000 up (RAM bank for $A000-$BFFF, ROM bank for $C000-$FFFF)");
+			return true;
+		}
+		b = (int)bank;
+	}
+	bool existed;
+	int id = mcp_bp_add((uint16_t)address, b, &existed);
+	if (id < 0) {
+		mcp_job_fail(job, "too many breakpoints (64 maximum)");
+		return true;
+	}
+	char bankstr[16] = "null";
+	if (b >= 0) {
+		snprintf(bankstr, sizeof(bankstr), "%d", b);
+	}
+	char tmp[160];
+	snprintf(tmp, sizeof(tmp), "{\"id\":%d,\"address\":\"0x%04X\",\"bank\":%s,\"already_set\":%s}",
+	         id, address, bankstr, existed ? "true" : "false");
+	json_buf_append(&job->text, tmp);
+	return true;
+}
+
+static const mcp_tool tool_set_breakpoint = {
+	"set_breakpoint",
+	"Sets an execution breakpoint: the emulator pauses just before the instruction at `address` executes. For "
+	"addresses from $A000 up, an optional `bank` restricts it to that RAM bank ($A000-$BFFF) or ROM bank "
+	"($C000-$FFFF); without it the breakpoint matches in any bank. Resuming from a breakpoint steps over it once. "
+	"Setting the same address and bank again returns the existing breakpoint. Returns its id.",
+	"{\"type\":\"object\",\"properties\":{"
+		"\"address\":{\"type\":[\"integer\",\"string\"],\"description\":\"integer or string such as \\\"0xC000\\\" or \\\"$C000\\\"\"},"
+		"\"bank\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255}},"
+	 "\"required\":[\"address\"],\"additionalProperties\":false}",
+	run_set_breakpoint,
+	0,
+	NULL
+};
+
+static bool
+run_clear_breakpoint(mcp_job *job)
+{
+	const json_node *all = json_get(job->args, "all");
+	uint32_t id;
+	bool have_id = json_get(job->args, "id") != NULL;
+	if (all && all->type == JSON_BOOL && all->boolean) {
+		if (have_id) {
+			mcp_job_fail(job, "pass either id or all, not both");
+			return true;
+		}
+		int n = mcp_bp_active;
+		mcp_bp_clear();
+		char tmp[48];
+		snprintf(tmp, sizeof(tmp), "{\"removed\":%d}", n);
+		json_buf_append(&job->text, tmp);
+		return true;
+	}
+	if (!have_id || !arg_uint(job, "id", &id)) {
+		mcp_job_fail(job, "pass id (an integer from set_breakpoint or list_breakpoints) or all=true");
+		return true;
+	}
+	if (!mcp_bp_remove((int)id)) {
+		mcp_job_fail(job, "no such breakpoint id");
+		return true;
+	}
+	json_buf_append(&job->text, "{\"removed\":1}");
+	return true;
+}
+
+static const mcp_tool tool_clear_breakpoint = {
+	"clear_breakpoint",
+	"Removes the breakpoint with the given id, or all breakpoints with all=true.",
+	"{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"all\":{\"type\":\"boolean\"}},\"additionalProperties\":false}",
+	run_clear_breakpoint,
+	0,
+	NULL
+};
+
+static bool
+run_list_breakpoints(mcp_job *job)
+{
+	json_buf_append(&job->text, "[");
+	int id, bank, i = 0;
+	uint16_t address;
+	unsigned hits;
+	while (mcp_bp_get(i, &id, &address, &bank, &hits)) {
+		char tmp[128];
+		if (bank < 0) {
+			snprintf(tmp, sizeof(tmp), "%s{\"id\":%d,\"address\":\"0x%04X\",\"bank\":null,\"hits\":%u}",
+			         i ? "," : "", id, address, hits);
+		} else {
+			snprintf(tmp, sizeof(tmp), "%s{\"id\":%d,\"address\":\"0x%04X\",\"bank\":%d,\"hits\":%u}",
+			         i ? "," : "", id, address, bank, hits);
+		}
+		json_buf_append(&job->text, tmp);
+		i++;
+	}
+	json_buf_append(&job->text, "]");
+	return true;
+}
+
+static const mcp_tool tool_list_breakpoints = {
+	"list_breakpoints",
+	"Lists the breakpoints with their ids, addresses, banks (null = any) and how often each was hit.",
+	"{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+	run_list_breakpoints,
+	0,
+	NULL
 };
 
 // ---- debug_stall (only registered when X16EMU_MCP_TEST is set) ----
@@ -302,7 +508,7 @@ static const mcp_tool tool_debug_stall = {
 const mcp_tool *const *
 mcp_tool_table(void)
 {
-	static const mcp_tool *table[8];
+	static const mcp_tool *table[12];
 	if (!table[0]) {
 		size_t n = 0;
 		table[n++] = &tool_get_registers;
@@ -311,6 +517,10 @@ mcp_tool_table(void)
 		table[n++] = &tool_get_screen;
 		table[n++] = &tool_pause;
 		table[n++] = &tool_continue;
+		table[n++] = &tool_run_frames;
+		table[n++] = &tool_set_breakpoint;
+		table[n++] = &tool_clear_breakpoint;
+		table[n++] = &tool_list_breakpoints;
 		if (getenv("X16EMU_MCP_TEST")) {
 			table[n++] = &tool_debug_stall;
 		}
