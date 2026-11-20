@@ -199,7 +199,7 @@ mcp_service(void)
 	if (SDL_AtomicGet(&work_flag)) {
 		service_jobs();
 	}
-	if (mcp_bp_active && !paused) {
+	if (mcp_debug_armed && !paused) {
 		mcp_debug_check();
 	}
 }

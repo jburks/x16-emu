@@ -60,16 +60,23 @@ typedef enum {
 	STOP_NONE,        // never stopped, or running since the last resume
 	STOP_PAUSE,       // paused by the pause tool or by a cancelled/timed-out run
 	STOP_BREAKPOINT,
-	STOP_FRAMES       // run_frames completed
+	STOP_FRAMES,      // run_frames completed
+	STOP_STEP,        // step completed
+	STOP_WATCHPOINT
 } mcp_stop_reason;
 
 typedef struct {
 	mcp_stop_reason reason;
 	int breakpoint_id;  // valid for STOP_BREAKPOINT
+	int watch_id;       // valid for STOP_WATCHPOINT
 } mcp_stop_info;
 
 extern mcp_stop_info mcp_last_stop;
-extern int mcp_bp_active; // number of breakpoints; read by mcp_service as a fast guard
+extern int mcp_bp_active; // number of breakpoints
+// True while anything needs mcp_debug_check() each pass (breakpoints, a step in progress, a pending watch hit).
+extern bool mcp_debug_armed;
+// Number of watchpoints; memory.c checks it on every CPU access so it must stay a plain int.
+extern int mcp_watch_active;
 
 #define MCP_MAX_BREAKPOINTS 64
 int mcp_bp_add(uint16_t address, int bank, bool *existed); // bank -1 = any; returns id, or -1 if full
@@ -77,6 +84,20 @@ bool mcp_bp_remove(int id);
 void mcp_bp_clear(void);
 // Iterates breakpoints: pass index 0..; returns false past the end.
 bool mcp_bp_get(int index, int *id, uint16_t *address, int *bank, unsigned *hits);
+// Watchpoints on CPU accesses (instruction fetches count as reads). A hit pauses
+// the emulator after the accessing instruction completes.
+#define MCP_MAX_WATCHPOINTS 32
+typedef enum { WATCH_READ = 1, WATCH_WRITE = 2, WATCH_RW = 3 } mcp_watch_access_t;
+int mcp_watch_add(uint16_t address, uint32_t length, int bank, int access, bool *existed); // -1 if full
+bool mcp_watch_remove(int id);
+void mcp_watch_clear(void);
+bool mcp_watch_get(int index, int *id, uint16_t *address, uint32_t *length, int *bank, int *access, unsigned *hits);
+// Called from read6502/write6502 only when mcp_watch_active != 0.
+void mcp_watch_hit(uint16_t address, bool write, uint8_t value);
+// Set while a tool performs its own memory accesses, so they do not trigger watchpoints.
+extern bool mcp_watch_suppress;
+// Starts executing `n` instructions from the paused state, then pauses (STOP_STEP).
+void mcp_step_begin(uint32_t n);
 // Called every emulator pass while running and breakpoints exist: pauses on a hit.
 void mcp_debug_check(void);
 // Resumes a paused emulator without re-hitting a breakpoint at the current pc.

@@ -13,6 +13,9 @@
 
 mcp_stop_info mcp_last_stop = { STOP_NONE, 0 };
 int mcp_bp_active = 0;
+bool mcp_debug_armed = false;
+int mcp_watch_active = 0;
+bool mcp_watch_suppress = false;
 
 extern uint32_t frames; // timing.c
 
@@ -28,6 +31,29 @@ static int next_id = 1;
 // Set when resuming so the instruction at the current pc, which may carry the
 // breakpoint we just stopped at, is allowed to execute once.
 static bool skip_once;
+static uint16_t skip_pc; // pc at the last stop: only an unchanged pc is stepped over
+
+static bool stepping;
+static uint32_t step_left;
+
+typedef struct {
+	int id;
+	uint16_t address;
+	uint32_t length;
+	int bank;
+	int access;
+	unsigned hits;
+} watch_t;
+static watch_t watches[MCP_MAX_WATCHPOINTS];
+static int next_watch_id = 1;
+static bool watch_pending;
+static struct { int id; uint16_t address; bool write; uint8_t value; uint16_t pc; } watch_hit;
+
+static void
+rearm(void)
+{
+	mcp_debug_armed = mcp_bp_active > 0 || stepping || watch_pending;
+}
 
 int
 mcp_bp_add(uint16_t address, int bank, bool *existed)
@@ -43,6 +69,7 @@ mcp_bp_add(uint16_t address, int bank, bool *existed)
 		return -1;
 	}
 	breakpoint_t *b = &bps[mcp_bp_active++];
+	mcp_debug_armed = true;
 	b->id = next_id++;
 	b->address = address;
 	b->bank = bank;
@@ -57,6 +84,7 @@ mcp_bp_remove(int id)
 		if (bps[i].id == id) {
 			memmove(&bps[i], &bps[i + 1], (size_t)(mcp_bp_active - i - 1) * sizeof(bps[0]));
 			mcp_bp_active--;
+			rearm();
 			return true;
 		}
 	}
@@ -67,6 +95,7 @@ void
 mcp_bp_clear(void)
 {
 	mcp_bp_active = 0;
+	rearm();
 }
 
 bool
@@ -85,20 +114,31 @@ mcp_bp_get(int index, int *id, uint16_t *address, int *bank, unsigned *hits)
 // A breakpoint above $A000 can be qualified with a bank: the RAM bank for
 // $A000-$BFFF, the ROM bank for $C000-$FFFF.
 static bool
-matches(const breakpoint_t *b, uint16_t pc)
+bank_ok(int bank, uint16_t address)
 {
-	if (b->address != pc) {
-		return false;
-	}
-	if (b->bank < 0 || pc < 0xA000) {
+	if (bank < 0 || address < 0xA000) {
 		return true;
 	}
-	return b->bank == (pc < 0xC000 ? memory_get_ram_bank() : memory_get_rom_bank());
+	return bank == (address < 0xC000 ? memory_get_ram_bank() : memory_get_rom_bank());
+}
+
+static bool
+matches(const breakpoint_t *b, uint16_t pc)
+{
+	return b->address == pc && bank_ok(b->bank, pc);
 }
 
 void
 mcp_stop(mcp_stop_reason reason)
 {
+	if (watch_pending) { // a watchpoint hit by the last instruction is the more useful thing to report
+		reason = STOP_WATCHPOINT;
+		watch_pending = false;
+		mcp_last_stop.watch_id = watch_hit.id;
+	}
+	stepping = false;
+	rearm();
+	skip_pc = regs.pc;
 	mcp_last_stop.reason = reason;
 	mcp_set_paused(true);
 }
@@ -111,15 +151,123 @@ mcp_resume(void)
 	mcp_set_paused(false);
 }
 
+void
+mcp_step_begin(uint32_t n)
+{
+	stepping = true;
+	step_left = n;
+	rearm();
+	mcp_resume();
+}
+
+int
+mcp_watch_add(uint16_t address, uint32_t length, int bank, int access, bool *existed)
+{
+	for (int i = 0; i < mcp_watch_active; i++) {
+		if (watches[i].address == address && watches[i].length == length && watches[i].bank == bank
+		    && watches[i].access == access) {
+			*existed = true;
+			return watches[i].id;
+		}
+	}
+	*existed = false;
+	if (mcp_watch_active >= MCP_MAX_WATCHPOINTS) {
+		return -1;
+	}
+	watch_t *w = &watches[mcp_watch_active];
+	w->id = next_watch_id++;
+	w->address = address;
+	w->length = length;
+	w->bank = bank;
+	w->access = access;
+	w->hits = 0;
+	mcp_watch_active++;
+	return w->id;
+}
+
+bool
+mcp_watch_remove(int id)
+{
+	for (int i = 0; i < mcp_watch_active; i++) {
+		if (watches[i].id == id) {
+			memmove(&watches[i], &watches[i + 1], (size_t)(mcp_watch_active - i - 1) * sizeof(watches[0]));
+			mcp_watch_active--;
+			return true;
+		}
+	}
+	return false;
+}
+
+void
+mcp_watch_clear(void)
+{
+	mcp_watch_active = 0;
+}
+
+bool
+mcp_watch_get(int index, int *id, uint16_t *address, uint32_t *length, int *bank, int *access, unsigned *hits)
+{
+	if (index < 0 || index >= mcp_watch_active) {
+		return false;
+	}
+	*id = watches[index].id;
+	*address = watches[index].address;
+	*length = watches[index].length;
+	*bank = watches[index].bank;
+	*access = watches[index].access;
+	*hits = watches[index].hits;
+	return true;
+}
+
+// Called from inside an instruction. Records the first hit; the emulator stops
+// at the top of the next pass, i.e. after the accessing instruction completes.
+void
+mcp_watch_hit(uint16_t address, bool write, uint8_t value)
+{
+	if (mcp_watch_suppress || mcp_is_paused()) {
+		return;
+	}
+	int want = write ? WATCH_WRITE : WATCH_READ;
+	for (int i = 0; i < mcp_watch_active; i++) {
+		watch_t *w = &watches[i];
+		if ((w->access & want) && (uint32_t)(address - w->address) < w->length && address >= w->address
+		    && bank_ok(w->bank, address)) {
+			w->hits++;
+			if (!watch_pending) {
+				watch_pending = true;
+				watch_hit.id = w->id;
+				watch_hit.address = address;
+				watch_hit.write = write;
+				watch_hit.value = value;
+				watch_hit.pc = opcode_addr;
+				mcp_debug_armed = true;
+			}
+			return;
+		}
+	}
+}
+
 // Called at the top of an emulator pass, i.e. before the instruction at regs.pc executes.
 void
 mcp_debug_check(void)
 {
+	if (watch_pending) {
+		mcp_stop(STOP_WATCHPOINT);
+		return;
+	}
 	if (waiting) {
 		return; // WAI/STP: the instruction at pc has already executed
 	}
-	if (skip_once) {
-		skip_once = false;
+	bool skip = skip_once && regs.pc == skip_pc;
+	skip_once = false;
+	if (stepping) {
+		if (step_left == 0) {
+			mcp_stop(STOP_STEP);
+			return;
+		}
+		step_left--;
+	}
+	if (skip) {
 		return;
 	}
 	uint16_t pc = regs.pc;
@@ -142,6 +290,8 @@ mcp_stop_name(void)
 	switch (mcp_last_stop.reason) {
 		case STOP_BREAKPOINT: return "breakpoint";
 		case STOP_FRAMES:     return "frames";
+		case STOP_STEP:       return "step";
+		case STOP_WATCHPOINT: return "watchpoint";
 		default:              return "paused";
 	}
 }
@@ -154,8 +304,17 @@ mcp_describe_stop(json_buf *out)
 	snprintf(tmp, sizeof(tmp), "{\"stopped\":\"%s\",\"pc\":\"0x%04X\",\"frames\":%u,\"ram_bank\":%u,\"rom_bank\":%u",
 	         why, regs.pc, frames, memory_get_ram_bank(), memory_get_rom_bank());
 	json_buf_append(out, tmp);
+	snprintf(tmp, sizeof(tmp), ",\"a\":\"0x%02X\",\"x\":\"0x%02X\",\"y\":\"0x%02X\",\"sp\":\"0x%04X\",\"status\":\"0x%02X\"",
+	         regs.a & 0xFF, regs.xl, regs.yl, regs.sp, regs.status);
+	json_buf_append(out, tmp);
 	if (mcp_is_paused() && mcp_last_stop.reason == STOP_BREAKPOINT) {
 		snprintf(tmp, sizeof(tmp), ",\"breakpoint\":%d", mcp_last_stop.breakpoint_id);
+		json_buf_append(out, tmp);
+	}
+	if (mcp_is_paused() && mcp_last_stop.reason == STOP_WATCHPOINT) {
+		snprintf(tmp, sizeof(tmp), ",\"watchpoint\":%d,\"access\":\"%s\",\"address\":\"0x%04X\",\"value\":\"0x%02X\","
+		         "\"accessing_pc\":\"0x%04X\"", watch_hit.id, watch_hit.write ? "write" : "read",
+		         watch_hit.address, watch_hit.value, watch_hit.pc);
 		json_buf_append(out, tmp);
 	}
 	json_buf_append(out, "}");
