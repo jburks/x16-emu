@@ -348,18 +348,20 @@ run_tool(const char *id_json, const mcp_tool *tool, json_node *msg)
 	if (to && to->type == JSON_NUMBER && to->number >= 1 && to->number <= 600000) {
 		timeout = (unsigned)to->number;
 	}
-	uint64_t deadline = SDL_GetTicks64() + timeout;
+	// SDL_GetTicks64 needs SDL 2.0.18; older distributions (Raspberry Pi OS, Ubuntu 20.04) ship less.
+	// The 32-bit counter wraps after 49 days, so measure elapsed time by subtraction.
+	Uint32 started = SDL_GetTicks();
 
 	SDL_LockMutex(queue_lock);
 	if (pending_tail) pending_tail->next = job; else pending_head = job;
 	pending_tail = job;
 	SDL_AtomicSet(&work_flag, 1);
 	while (!job->done) {
-		uint64_t now = SDL_GetTicks64();
-		if (now >= deadline) {
+		Uint32 elapsed = SDL_GetTicks() - started;
+		if (elapsed >= timeout) {
 			break;
 		}
-		SDL_CondWaitTimeout(queue_cond, queue_lock, (Uint32)(deadline - now));
+		SDL_CondWaitTimeout(queue_cond, queue_lock, timeout - elapsed);
 	}
 	if (!job->done) {
 		job->abandoned = true; // the emulator thread frees it from here on

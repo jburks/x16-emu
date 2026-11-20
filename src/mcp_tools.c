@@ -1528,9 +1528,9 @@ run_debug_stall(mcp_job *job)
 		return true;
 	}
 	if (job->polls == 0) {
-		job->scratch[0] = SDL_GetTicks64();
+		job->scratch[0] = SDL_GetTicks();
 	}
-	uint64_t elapsed = SDL_GetTicks64() - job->scratch[0];
+	uint32_t elapsed = SDL_GetTicks() - (uint32_t)job->scratch[0];
 	if (elapsed < (uint64_t)ms->number) {
 		return false;
 	}

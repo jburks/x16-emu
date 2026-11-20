@@ -583,6 +583,15 @@ screenshot(void)
 
 // Encodes the current framebuffer as a 640x480 RGB PNG into a malloc'd buffer
 // (free() it). Returns NULL on failure. Used by the MCP server.
+#ifdef __EMSCRIPTEN__
+uint8_t *
+video_get_png(int *len)
+{
+	// The WebAssembly build has no PNG encoder (and no MCP server to ask for one).
+	(void)len;
+	return NULL;
+}
+#else
 uint8_t *
 video_get_png(int *len)
 {
@@ -593,6 +602,7 @@ video_get_png(int *len)
 	}
 	return stbi_write_png_to_mem(png_buffer, SCREEN_WIDTH * 3, SCREEN_WIDTH, SCREEN_HEIGHT, 3, len);
 }
+#endif
 
 struct video_sprite_properties sprite_properties[128];
 
