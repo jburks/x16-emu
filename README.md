@@ -46,6 +46,10 @@ loaded from the directory containing the emulator binary, or you can use the `-r
 
 You can build a ROM image yourself using the [build instructions][x16rom-build] in the [x16-rom] repo. The `rom.bin` included in the [_latest_ release][releases] of the emulator may also work with the HEAD of this repo, but this is not guaranteed.
 
+### MCP Server
+
+With `-mcp` the emulator can be inspected and driven by an AI agent or other MCP client (memory, screen, breakpoints, watchpoints, stepping, keyboard). See [MCP.md](MCP.md).
+
 ### macOS Build
 
 Install SDL2 using `brew install sdl2`.

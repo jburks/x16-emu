@@ -397,7 +397,18 @@ handle_initialize(const char *id_json, const json_node *params)
 	json_buf_append(&b, ",\"capabilities\":{\"tools\":{\"listChanged\":false}},"
 	                    "\"serverInfo\":{\"name\":\"x16emu\",\"version\":");
 	json_buf_append_string(&b, VER, strlen(VER));
-	json_buf_append(&b, "}}");
+	json_buf_append(&b, "},\"instructions\":");
+	static const char instructions[] =
+		"Controls a running Commander X16 emulator. Pause before inspecting memory or the screen; "
+		"run_frames(n) advances exactly n video frames and leaves the emulator paused (deterministic), "
+		"continue resumes at normal speed. Breakpoints and watchpoints pause the emulator; use "
+		"continue{wait:true} to block until one hits. step needs the emulator paused. Tools that wait "
+		"accept timeout_ms and leave the emulator paused if it expires. Addresses may be integers or "
+		"strings such as \"$9F20\". The emulator boots to BASIC in about 3-5 s: wait for READY. "
+		"(text layer at VRAM $1B000, 256 bytes per row, character at every other byte) before typing. "
+		"Start with -zeroram for bit-identical runs. Full documentation: MCP.md in the emulator repository.";
+	json_buf_append_string(&b, instructions, sizeof(instructions) - 1);
+	json_buf_append(&b, "}");
 	send_result(id_json, b.data);
 	json_buf_free(&b);
 }

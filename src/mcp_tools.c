@@ -112,7 +112,7 @@ run_get_status(mcp_job *job)
 static const mcp_tool tool_get_status = {
 	"get_status",
 	"Returns emulator progress: the number of video frames completed since start (about 60 per emulated second), "
-	"the CPU cycle count at the last completed frame, the emulated clock in MHz, warp mode, lag_ms (how far emulation is behind wall-clock time; it grows if the host cannot keep up), whether paused, the state (running, paused, breakpoint or frames: why it last stopped) and the number of breakpoints.",
+	"the CPU cycle count at the last completed frame, the emulated clock in MHz, warp mode, lag_ms (how far emulation is behind wall-clock time; it grows if the host cannot keep up), whether paused, the state (running, paused, breakpoint, watchpoint, step or frames: why it last stopped) and the number of breakpoints.",
 	"{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
 	run_get_status,
 	0
