@@ -53,10 +53,13 @@ executable.
 
 ### Giving the emulator a disk
 
-`-fsroot /path/to/folder` makes a host folder the emulated drive, so BASIC
-`LOAD` and `SAVE` work on its files. Add it to the arguments in any of the
-examples above. It complements `load_prg`: `load_prg` puts a program straight
-into memory, while `-fsroot` lets programs find their own data files.
+The emulated machine's drive is a host folder: by default the emulator's
+current directory, or whatever you pass with `-fsroot /path/to/folder`. BASIC
+`LOAD` and `SAVE`, and programs that open files, read and write there. Add
+`-fsroot` to the arguments in any of the examples above to choose the folder
+(an empty scratch directory is a good choice for an agent). It complements
+`load_prg`: `load_prg` puts a program straight into memory, while the drive lets
+programs find their own data files.
 
 ### Running in the background (no window)
 
@@ -76,6 +79,11 @@ window. The only things you lose are the ones you would see and hear yourself.
 (The flag is not specific to MCP, but without `-mcp` nothing can reach the
 emulator.)
 
+For test automation, where many 60-frame runs would otherwise take real time,
+add `-warp` as well: emulated time then passes as fast as the host can manage,
+about twice real time or more. Nothing about the emulated machine changes. You
+can also toggle it at runtime with `set_warp`.
+
 ### Scripting it directly
 
 ```python
@@ -92,6 +100,30 @@ print(rpc(2, "tools/call", {"name": "get_registers", "arguments": {}}))
 ```
 
 Closing the emulator's stdin makes it exit.
+
+### Host files and permissions
+
+The emulator runs with the permissions of the user who starts it, and so does
+anything an agent asks it to do. Three tools touch host files:
+
+- `load_prg` **reads** any file that user can read (up to 1 MB).
+- `read_memory` and `get_screen` with `path` **create** files anywhere that user
+  can write. An existing file is replaced only with `overwrite: true`, but with
+  that flag any file that user can write can be replaced.
+- Relative paths are relative to the emulator's working directory, which is
+  normally the directory the client was started in.
+
+**There is currently no restriction to a directory.** Treat an attached agent as
+having the same file access as the emulator process. If that is more than you
+want, run the emulator as an unprivileged user, in a container, or in a scratch
+directory with nothing in it you care about.
+
+The emulated machine has its own route to the host: its drive (see "Giving the
+emulator a disk") is the emulator's current directory unless you pass
+`-fsroot`, and an agent that types `SAVE` or `LOAD` at the BASIC prompt reads
+and writes files in that folder, and can scratch (delete) them. Use `-fsroot`
+with a scratch directory. Everything else (memory, registers, keyboard, mouse)
+acts only on the emulated machine.
 
 ### Details for client authors
 
@@ -164,18 +196,45 @@ Tips:
 
 Addresses and values may be given as JSON integers or as strings such as
 `"0x9F20"` or `"$9F20"`. Results are JSON text, except `get_screen`, which
-returns a PNG image.
+returns a PNG image (with `path` it writes the file instead and returns JSON text
+giving the path and the byte count).
 
 ### Inspect
 
 | Tool | Arguments | What it does |
 |---|---|---|
-| `get_registers` | none | pc, a, x, y, sp, status, current RAM and ROM bank, paused flag, and `cycles`: the exact number of CPU clock cycles executed since start. Subtract two values to measure what a routine costs. |
-| `get_status` | none | frames, `cycles`, cycle count at the last frame, clock in MHz, warp, `lag_ms`, paused, state, number of breakpoints |
-| `read_memory` | `address`\*, `space`, `count`, `bank` | Reads up to 131072 bytes without side effects (I/O is not triggered). `space` is `cpu` (default; `$A000-$BFFF` banked RAM, `$C000-$FFFF` banked ROM, using the current banks unless `bank` is given) or `vram` (the 128 KB VERA space, including palette at `0x1FA00` and sprite attributes at `0x1FC00`). Returns one lowercase hex string. With `path`, the raw bytes are written to that host file instead and only the byte count is returned, which keeps large buffers (a 38,400-byte frame buffer is about 77 KB as hex) out of the conversation. An existing file is replaced only with `overwrite: true`. |
-| `hash_memory` | `address`\*, `count`\*, `space`, `bank`, `algorithm` | CRC32 and/or SHA-256 (`algorithm`: `crc32`, `sha256` or `both`, the default) of a range, read like `read_memory`. Compare a buffer against a known value without transferring it. The CRC32 is the standard one (`zlib.crc32`). |
+| `get_registers` | none | pc, a, x, y, sp, status, current RAM and ROM bank, paused flag, and `cycles`: the exact number of CPU clock cycles executed since start. Subtract two values to measure what a routine costs; it is an unsigned 64-bit count, so it does not wrap in practice. Tool calls take no emulated time, so `cycles` only moves while the emulator runs, and it keeps counting across `reset` and `set_warp`. |
+| `get_status` | none | `frames` completed; `cycles` (the exact count right now, same as in `get_registers`); `cpu_cycles_at_last_frame` (the count when the last frame completed, which only changes once per frame); clock in MHz; `warp`; `lag_ms`; `paused`; `state`; number of breakpoints |
+| `read_memory` | `address`\*, `space`, `count`, `bank`, `path`, `overwrite` | Reads 1 to 131072 bytes (`count`, default 16; the same limit applies with `path`) without side effects (I/O is not triggered). `space` is `cpu` (default; `$A000-$BFFF` banked RAM, `$C000-$FFFF` banked ROM, using the current banks unless `bank` is given) or `vram` (the 128 KB VERA space, including palette at `0x1FA00` and sprite attributes at `0x1FC00`). Returns one lowercase hex string. With `path`, the raw bytes are written to that host file instead and only the byte count is returned, which keeps large buffers (a 38,400-byte frame buffer is about 77 KB as hex) out of the conversation. An existing file is replaced only with `overwrite: true`. |
+| `hash_memory` | `address`\*, `count`\* (1 to 131072), `space`, `bank`, `algorithm` | CRC32 and/or SHA-256 (`algorithm`: `crc32`, `sha256` or `both`, the default) of a range, read like `read_memory`. Compare a buffer against a known value without transferring it. The CRC32 is the standard one (`zlib.crc32`). |
 | `get_vera_state` | none | VERA's internal state, which the registers at `$9F20-$9F3F` do not show: both data ports at once (address, signed step, increment field, prefetched byte, nibble flags), `addrsel` and `dcsel`, the IRQ enable and status bits, the line-compare value and whether IRQ is asserted, the current raster line, and the FX state (mode, flags, the four cache bytes as hex, pixel increments and positions as decimals plus `_raw` hex, polygon length, affine bases, multiplier accumulator). Reading has no side effects. |
 | `get_screen` | `path`, `overwrite` | 640x480 PNG of the current framebuffer. With `path` it is written to that host file instead of being returned. |
+
+Example `get_vera_state` result, trimmed (a real run, paused at the BASIC prompt
+after setting ADDR0 to `$11234` with an increment of 1):
+
+```json
+{"addrsel":0, "dcsel":0,
+ "data_ports":[
+   {"port":0, "address":"0x11234", "step":1, "increment_field":2, "prefetched_byte":"0xEA",
+    "nibble_bit":false, "nibble_increment":false},
+   {"port":1, "address":"0x00000", "step":0, "increment_field":0, "prefetched_byte":"0x00",
+    "nibble_bit":false, "nibble_increment":false}],
+ "irq":{"enable":"0x1", "status":"0x02", "line_compare":0, "irq_asserted":false},
+ "video":{"scanline":140, "ntsc":false},
+ "fx":{"addr1_mode":0, "four_bit_mode":false, "cache_fill":false, "cache_write":false,
+       "multiplier":false, "cache_byte_index":0,
+       "x_pixel_increment":0.0, "x_pixel_increment_raw":"0x00000000",
+       "x_pixel_position":0.5, "x_pixel_position_raw":"0x00008000",
+       "poly_fill_length":0, "affine_tile_base":"0x00000", "affine_map_base":"0x00000",
+       "cache":"00000000", "multiplier_accumulator":0, "...":"(and the other FX flags)"}}
+```
+
+`step` is the signed address step after the decrement bit is applied (`-4` for a
+decrement of 4). `increment_field` is the raw 5-bit value (code in the upper four
+bits, decrement flag in the lowest). FX pixel values are 16.16 fixed point: each
+comes as a decimal and as a `_raw` hex value, and `cache` lists the four cache
+bytes in order.
 
 ### Run control
 
@@ -229,7 +288,7 @@ Watchpoint limits to know about:
 |---|---|---|
 | `write_memory` | `address`\*, `hex`\*, `space`, `bank` | Writes bytes given as hex (`"A9 01 8D 00 04"`). `cpu` space goes through the normal write path, so I/O registers have their usual side effects, but it takes no emulated time and does not trigger watchpoints. ROM (`$C000` and up) is rejected. `bank` selects the RAM bank for `$A000-$BFFF`. `vram` space writes the VERA address space directly. |
 | `set_registers` | any of `pc`, `a`, `x`, `y`, `sp`, `status`, `ram_bank`, `rom_bank` | Paused only. Setting `pc` also ends a WAI/STP wait. A breakpoint at the new `pc` fires when you resume. |
-| `reset` | `zero_ram` | Resets the machine as if the reset button were pressed: the CPU restarts at the reset vector, VERA, the VIAs and the input queues are reset, and text still waiting to be typed is dropped. RAM keeps its contents, as on real hardware, unless `zero_ram: true`, which zeroes RAM and banked RAM and refills VRAM as at a fresh `-zeroram` start. A paused emulator stays paused at the reset vector. Breakpoints, watchpoints and the frame and cycle counters are kept. |
+| `reset` | `zero_ram` | Resets the machine as if the reset button were pressed: the CPU restarts at the reset vector, VERA, the VIAs and the input queues are reset, and text still waiting to be typed is dropped. RAM keeps its contents, as on real hardware, unless `zero_ram: true`, which zeroes RAM and banked RAM and refills VRAM as at a fresh `-zeroram` start. A paused emulator stays paused at the reset vector. Breakpoints, watchpoints and the frame and cycle counters are kept. The machine needs about 36 frames after a reset to reach the `READY.` prompt, so run frames before `load_prg` with `run: true` or before typing. |
 | `set_warp` | `enabled`\* | Turns warp mode on or off. In warp mode the emulator is not held to real time, so frames pass as fast as the host can emulate them. Behaviour is unchanged; only the speed limiter is bypassed. |
 | `send_key` | `key`\*, `action`, `hold_frames`, `timeout_ms` | Sends a key to the emulated PS/2 keyboard. `key` is an [SDL key name](https://wiki.libsdl.org/SDL2/SDL_Scancode) (`Return`, `A`, `Space`, `Left`, `F5`, `Left Shift`, ...). `action` is `tap` (default), `down` or `up`. `hold_frames` keeps a tapped key down for that many frames; use it for programs that poll key state (needs the emulator running). |
 | `type_text` | `text`\*, `wait`, `timeout_ms` | Types into the KERNAL keyboard buffer. `\n` is Enter. If the emulator is paused the text is queued and typed after `continue`. With `wait: true` it returns when everything is typed, not when the program it started finishes. |

@@ -58,6 +58,24 @@ for label, tool, a in (("missing directory", "read_memory", {"address": 0, "coun
                        ("path is a directory", "get_screen", {"path": tmp, "overwrite": True})):
     err, t = e.call(tool, a); check("rejects " + label, err, t)
 
+# ---------------- documented limits ----------------
+big = os.path.join(tmp, "all_vram.bin")
+r = e.ok("read_memory", {"space": "vram", "address": 0, "count": 131072, "path": big})
+check("read_memory path: the full 131,072-byte maximum works", r["bytes_written"] == 131072 and os.path.getsize(big) == 131072, r)
+check("hash_memory: the maximum count 131,072 works", e.ok("hash_memory", {"space": "vram", "address": 0, "count": 131072})["sha256"]
+      == hashlib.sha256(open(big, "rb").read()).hexdigest())
+err, t = e.call("read_memory", {"space": "vram", "address": 0, "count": 131073, "path": os.path.join(tmp, "toobig.bin")})
+check("read_memory path: 131,073 is rejected and no file is created", err and not os.path.exists(os.path.join(tmp, "toobig.bin")), t)
+err, t = e.call("hash_memory", {"space": "vram", "address": 0, "count": 131073}); check("hash_memory: 131,073 is rejected", err, t)
+rel = "x16mcp-reltest-%d.bin" % os.getpid()
+relpath = os.path.join(d, rel)                      # the emulator runs with the executable's directory as its working directory
+try:
+    e.ok("read_memory", {"address": 0x400, "count": 9, "path": rel})
+    check("a relative path is relative to the emulator's working directory", os.path.exists(relpath) and open(relpath, "rb").read() == b"123456789")
+finally:
+    if os.path.exists(relpath): os.remove(relpath)
+check("cycles is a plain integer (unsigned 64-bit in the server)", isinstance(e.ok("get_registers")["cycles"], int) and e.status()["cycles"] >= 0)
+
 # ---------------- cycle counts ----------------
 e.ok("write_memory", {"address": 0x600, "hex": "A905 8510 E610 4C0906"})   # LDA #5 / STA $10 / INC $10 / JMP $0609 (spin)
 e.ok("set_registers", {"pc": 0x600, "status": 0x24})
