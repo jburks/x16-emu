@@ -201,6 +201,7 @@ set(X16_SOURCES
     src/mcp_tools.c
     src/mcp_debug.c
     src/mcp_hash.c
+    src/mcp_paths.c
     src/files.c
     src/cartridge.c
     src/iso_8859_15.c

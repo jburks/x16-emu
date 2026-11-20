@@ -34,19 +34,20 @@ def finish():
     sys.exit(1 if fails else 0)
 
 
-def spawn(extra=(), env=None, stderr=subprocess.DEVNULL, rom=None):
+def spawn(extra=(), env=None, stderr=subprocess.DEVNULL, rom=None, cwd=None):
     """Starts the emulator in MCP mode (windowless unless X16EMU_TEST_WINDOW is set)."""
     args = [exe, "-mcp"]
     if not os.environ.get("X16EMU_TEST_WINDOW"):
         args.append("-nowindow")
     args += list(extra) + ["-rom", rom or rom_path]
     return subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
-                            text=True, cwd=d, env=env)
+                            text=True, cwd=cwd or d, env=env)
 
 
 class Emu:
-    def __init__(self, extra=(), rom=None):
-        self.p = spawn(extra, rom=rom)
+    def __init__(self, extra=(), rom=None, env=None, cwd=None, stderr=subprocess.DEVNULL):
+        """env: extra environment variables (added to the current ones); cwd: the emulator's working directory."""
+        self.p = spawn(extra, rom=rom, env=dict(os.environ, **env) if env else None, cwd=cwd, stderr=stderr)
         self.n = 0
         self.rpc("initialize", {"protocolVersion": "2025-11-25"})
 

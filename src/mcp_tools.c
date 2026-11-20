@@ -12,6 +12,7 @@
 #include "video.h"
 #include "keyboard.h"
 #include "mcp_hash.h"
+#include "mcp_paths.h"
 #include <zlib.h>
 #include "i2c.h"
 #include "cpu/fake6502.h"
@@ -107,17 +108,26 @@ run_get_status(mcp_job *job)
 	long long lag_ms = (long long)(SDL_GetTicks() - sdlTicks_base) - cpu_ticks / MHZ / 1000;
 	snprintf(tmp, sizeof(tmp),
 		"{\"frames\":%u,\"cycles\":%llu,\"cpu_cycles_at_last_frame\":%lld,\"mhz\":%u,\"warp\":%s,\"lag_ms\":%lld,\"paused\":%s,"
-		"\"state\":\"%s\",\"breakpoints\":%d}",
+		"\"state\":\"%s\",\"breakpoints\":%d,\"host_paths\":\"%s\",\"host_root\":",
 		frames, (unsigned long long)mcp_total_cycles(), (long long)cpu_ticks, (unsigned)MHZ, warp_mode ? "true" : "false", lag_ms,
-		mcp_is_paused() ? "true" : "false", mcp_stop_name(), mcp_bp_active);
+		mcp_is_paused() ? "true" : "false", mcp_stop_name(), mcp_bp_active,
+		mcp_paths_get_mode() == MCP_PATHS_RESTRICTED ? "restricted" :
+		mcp_paths_get_mode() == MCP_PATHS_UNRESTRICTED ? "unrestricted" : "disabled");
 	json_buf_append(&job->text, tmp);
+	const char *root = mcp_paths_root();
+	if (root) {
+		json_buf_append_string(&job->text, root, strlen(root));
+	} else {
+		json_buf_append(&job->text, "null");
+	}
+	json_buf_append(&job->text, "}");
 	return true;
 }
 
 static const mcp_tool tool_get_status = {
 	"get_status",
 	"Returns emulator progress: the number of video frames completed since start (about 60 per emulated second), "
-	"the CPU cycle count at the last completed frame, the emulated clock in MHz, warp mode, lag_ms (how far emulation is behind wall-clock time; it grows if the host cannot keep up), whether paused, the state (running, paused, breakpoint, watchpoint, step or frames: why it last stopped) and the number of breakpoints.",
+	"the CPU cycle count at the last completed frame, the emulated clock in MHz, warp mode, lag_ms (how far emulation is behind wall-clock time; it grows if the host cannot keep up), whether paused, the state (running, paused, breakpoint, watchpoint, step or frames: why it last stopped) and the number of breakpoints. Also host_paths (\"restricted\", \"unrestricted\" or \"disabled\") and host_root: the folder that load_prg and the path arguments of read_memory and get_screen must stay inside (null when unrestricted or disabled).",
 	"{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
 	run_get_status,
 	0
@@ -248,6 +258,18 @@ dump_to_file(mcp_job *job, const char *path, const uint8_t *data, size_t len, bo
 	return true;
 }
 
+// Applies the host path policy (see mcp_paths.h): turns the client's path into the one to open, or fails the job.
+static bool
+host_path(mcp_job *job, const char *path, char *out, size_t out_size)
+{
+	char err[900];
+	if (!mcp_path_resolve(path, out, out_size, err, sizeof(err))) {
+		mcp_job_fail(job, err);
+		return false;
+	}
+	return true;
+}
+
 static bool
 run_read_memory(mcp_job *job)
 {
@@ -263,9 +285,13 @@ run_read_memory(mcp_job *job)
 		return true;
 	}
 	fetch_mem_range(&r, buf);
-	if (path && !dump_to_file(job, path, buf, r.count, overwrite)) {
+	char resolved[4200];
+	if (path && (!host_path(job, path, resolved, sizeof(resolved)) || !dump_to_file(job, resolved, buf, r.count, overwrite))) {
 		free(buf);
 		return true;
+	}
+	if (path) {
+		path = resolved; // report where it really went
 	}
 
 	json_buf *t = &job->text;
@@ -304,8 +330,8 @@ static const mcp_tool tool_read_memory = {
 	"address space (0x00000-0x1FFFF), including the palette at 0x1FA00 and sprite attributes at 0x1FC00. "
 	"Returns JSON with the bytes as one lowercase hex string. With `path` the raw bytes are written to that host "
 	"file instead and only the byte count is returned, which keeps large buffers out of the conversation; an "
-	"existing file is only replaced if `overwrite` is true. Relative paths are relative to the emulator's working "
-	"directory.",
+	"existing file is only replaced if `overwrite` is true. Host paths must lie inside the folder shown as host_root "
+	"by get_status; relative paths are relative to it.",
 	"{\"type\":\"object\",\"properties\":{"
 		"\"space\":{\"type\":\"string\",\"enum\":[\"cpu\",\"vram\"],\"default\":\"cpu\"},"
 		"\"address\":{\"type\":[\"integer\",\"string\"],\"description\":\"integer or string such as \\\"0x9F20\\\" or \\\"$9F20\\\"\"},"
@@ -397,11 +423,12 @@ run_get_screen(mcp_job *job)
 		return true;
 	}
 	if (path) {
-		bool ok = dump_to_file(job, path, png, (size_t)len, overwrite);
+		char resolved[4200];
+		bool ok = host_path(job, path, resolved, sizeof(resolved)) && dump_to_file(job, resolved, png, (size_t)len, overwrite);
 		free(png);
 		if (ok) {
 			json_buf_append(&job->text, "{\"path\":");
-			json_buf_append_string(&job->text, path, strlen(path));
+			json_buf_append_string(&job->text, resolved, strlen(resolved));
 			char tmp[48];
 			snprintf(tmp, sizeof(tmp), ",\"bytes_written\":%d}", len);
 			json_buf_append(&job->text, tmp);
@@ -419,7 +446,8 @@ static const mcp_tool tool_get_screen = {
 	"get_screen",
 	"Returns a 640x480 PNG screenshot of the emulator's current framebuffer. If the emulator is running, the image "
 	"may show a frame that is still being drawn; pause first for a stable image. With `path` the PNG is written to "
-	"that host file instead of being returned; an existing file is only replaced if `overwrite` is true.",
+	"that host file instead of being returned; an existing file is only replaced if `overwrite` is true. The path must "
+	"lie inside the folder shown as host_root by get_status; relative paths are relative to it.",
 	"{\"type\":\"object\",\"properties\":{"
 		"\"path\":{\"type\":\"string\",\"description\":\"write the PNG to this host file instead of returning it\"},"
 		"\"overwrite\":{\"type\":\"boolean\",\"default\":false}},\"additionalProperties\":false}",
@@ -1387,10 +1415,14 @@ run_load_prg(mcp_job *job)
 		return true;
 	}
 
-	FILE *f = fopen(path, "rb");
+	char resolved[4200];
+	if (!host_path(job, path, resolved, sizeof(resolved))) {
+		return true;
+	}
+	FILE *f = fopen(resolved, "rb");
 	if (!f) {
 		char msg[600];
-		snprintf(msg, sizeof(msg), "cannot open %.400s: %s", path, strerror(errno));
+		snprintf(msg, sizeof(msg), "cannot open %.400s: %s", resolved, strerror(errno));
 		mcp_job_fail(job, msg);
 		return true;
 	}
@@ -1557,7 +1589,8 @@ static const mcp_tool tool_load_prg = {
 	"runs past $BFFF continues in the next bank. A load at $0801 is taken to be a BASIC program, and BASIC's "
 	"program-end pointers are set as the LOAD command would, using the release 49 layout (the result says whether "
 	"they were set, names the ROM release, and warns if the ROM is detectably older than r49). With run=true the emulator is told to start it by typing RUN (BASIC) or SYS <address> (machine "
-	"code), which needs the emulator running at the BASIC prompt. Do not load while another program is running "
+	"code), which needs the emulator running at the BASIC prompt. The path must lie inside the folder shown as "
+	"host_root by get_status; relative paths are relative to it. Do not load while another program is running "
 	"unless you mean to overwrite it. Returns the start, the end (exclusive) and the size.",
 	"{\"type\":\"object\",\"properties\":{"
 		"\"path\":{\"type\":\"string\",\"description\":\"host file path\"},"

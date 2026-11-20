@@ -59,7 +59,9 @@ current directory, or whatever you pass with `-fsroot /path/to/folder`. BASIC
 `-fsroot` to the arguments in any of the examples above to choose the folder
 (an empty scratch directory is a good choice for an agent). It complements
 `load_prg`: `load_prg` puts a program straight into memory, while the drive lets
-programs find their own data files.
+programs find their own data files. The same folder is the default **host path
+root**: `load_prg` and the file dumps are limited to it (see "Host files and
+permissions").
 
 ### Running in the background (no window)
 
@@ -104,26 +106,51 @@ Closing the emulator's stdin makes it exit.
 ### Host files and permissions
 
 The emulator runs with the permissions of the user who starts it, and so does
-anything an agent asks it to do. Three tools touch host files:
+anything an agent asks it to do. Three tools touch host files: `load_prg` reads
+a PRG, and `read_memory` and `get_screen` with `path` write a file. These are
+**limited to one folder, the host path root**, unless you turn the restriction
+off.
 
-- `load_prg` **reads** any file that user can read (up to 1 MB).
-- `read_memory` and `get_screen` with `path` **create** files anywhere that user
-  can write. An existing file is replaced only with `overwrite: true`, but with
-  that flag any file that user can write can be replaced.
-- Relative paths are relative to the emulator's working directory, which is
-  normally the directory the client was started in.
+**Where the root is.** In order of preference:
 
-**There is currently no restriction to a directory.** Treat an attached agent as
-having the same file access as the emulator process. If that is more than you
-want, run the emulator as an unprivileged user, in a container, or in a scratch
-directory with nothing in it you care about.
+1. `X16EMU_MCP_ROOT`, if set, names the folder.
+2. Otherwise the folder of the emulated drive: the `-fsroot` folder, or the
+   emulator's current directory when there is no `-fsroot` (the same folder the
+   emulated machine's own `LOAD` and `SAVE` use, so the tools add no access the
+   agent does not already have through BASIC).
 
-The emulated machine has its own route to the host: its drive (see "Giving the
-emulator a disk") is the emulator's current directory unless you pass
-`-fsroot`, and an agent that types `SAVE` or `LOAD` at the BASIC prompt reads
-and writes files in that folder, and can scratch (delete) them. Use `-fsroot`
-with a scratch directory. Everything else (memory, registers, keyboard, mouse)
-acts only on the emulated machine.
+`get_status` shows the result as `host_root` and `host_paths`. The emulator also
+prints one line about it to stderr at startup. Relative paths are taken relative
+to the root, and a path must lie inside it: `..` segments are resolved first, so
+`../elsewhere/file` is refused, and so is any absolute path outside the root.
+
+**Turning it off.** Set `X16EMU_MCP_UNRESTRICTED=1` and every path is allowed
+(relative paths are then relative to the emulator's working directory). The
+value `0` does not turn it off.
+
+**A drive root is refused.** If the root works out to a drive root (`/`, or
+`C:\`), for example because the client launched the emulator from `/`, there
+would be nothing to restrict, so the three path features are switched off and
+say why. Pass `-fsroot` or set `X16EMU_MCP_ROOT` to a project folder, or use
+`X16EMU_MCP_UNRESTRICTED=1` if you really mean to allow everything. A root that
+is your home directory is allowed, with a warning on stderr.
+
+**Symbolic links are not examined.** A path is judged by its text. A symbolic
+link inside the root that points outside it is followed, and so is `link/..`
+when `link` is one. The restriction keeps a mistaken or manipulated agent from
+wandering by accident or by an instruction to write to `/etc`; it is not a
+sandbox against a hostile program, and there is a small gap between checking a
+path and opening it. If you need real isolation, run the emulator as an
+unprivileged user, in a container, or in a scratch directory.
+
+On Windows, `\` and `/` are both accepted and paths are compared without regard
+to case. That code path has not been tested here.
+
+The emulated machine has its own route to the host: an agent that types `SAVE`
+or `LOAD` at the BASIC prompt reads and writes files in the emulated drive
+folder, and can scratch (delete) them. Use `-fsroot` with a scratch directory.
+Everything else (memory, registers, keyboard, mouse) acts only on the emulated
+machine.
 
 ### Details for client authors
 
@@ -144,6 +171,9 @@ acts only on the emulated machine.
   **paused**, so you can inspect where it got to.
 - **Errors:** bad arguments and failed operations are returned as normal tool
   results with `isError: true` and a message, not as protocol errors.
+- **Environment variables:** `X16EMU_MCP_ROOT` (host path root),
+  `X16EMU_MCP_UNRESTRICTED` (turn the host path restriction off),
+  `X16EMU_MCP_TIMEOUT_MS` (default timeout) and `X16EMU_MCP_LOG` (traffic log).
 - **Cost when idle:** without `-mcp` nothing runs. With `-mcp` and nothing
   stopped, the emulator loop makes one cheap check per pass. Watchpoints add a
   test to every CPU memory access, so avoid leaving them set when you do not
@@ -204,11 +234,11 @@ giving the path and the byte count).
 | Tool | Arguments | What it does |
 |---|---|---|
 | `get_registers` | none | pc, a, x, y, sp, status, current RAM and ROM bank, paused flag, and `cycles`: the exact number of CPU clock cycles executed since start. Subtract two values to measure what a routine costs; it is an unsigned 64-bit count, so it does not wrap in practice. Tool calls take no emulated time, so `cycles` only moves while the emulator runs, and it keeps counting across `reset` and `set_warp`. |
-| `get_status` | none | `frames` completed; `cycles` (the exact count right now, same as in `get_registers`); `cpu_cycles_at_last_frame` (the count when the last frame completed, which only changes once per frame); clock in MHz; `warp`; `lag_ms`; `paused`; `state`; number of breakpoints |
-| `read_memory` | `address`\*, `space`, `count`, `bank`, `path`, `overwrite` | Reads 1 to 131072 bytes (`count`, default 16; the same limit applies with `path`) without side effects (I/O is not triggered). `space` is `cpu` (default; `$A000-$BFFF` banked RAM, `$C000-$FFFF` banked ROM, using the current banks unless `bank` is given) or `vram` (the 128 KB VERA space, including palette at `0x1FA00` and sprite attributes at `0x1FC00`). Returns one lowercase hex string. With `path`, the raw bytes are written to that host file instead and only the byte count is returned, which keeps large buffers (a 38,400-byte frame buffer is about 77 KB as hex) out of the conversation. An existing file is replaced only with `overwrite: true`. |
+| `get_status` | none | `frames` completed; `cycles` (the exact count right now, same as in `get_registers`); `cpu_cycles_at_last_frame` (the count when the last frame completed, which only changes once per frame); clock in MHz; `warp`; `lag_ms`; `paused`; `state`; number of breakpoints; `host_paths` (`restricted`, `unrestricted` or `disabled`) and `host_root` (the folder host paths must stay inside) |
+| `read_memory` | `address`\*, `space`, `count`, `bank`, `path`, `overwrite` | Reads 1 to 131072 bytes (`count`, default 16; the same limit applies with `path`) without side effects (I/O is not triggered). `space` is `cpu` (default; `$A000-$BFFF` banked RAM, `$C000-$FFFF` banked ROM, using the current banks unless `bank` is given) or `vram` (the 128 KB VERA space, including palette at `0x1FA00` and sprite attributes at `0x1FC00`). Returns one lowercase hex string. With `path`, the raw bytes are written to that host file instead and only the byte count is returned, which keeps large buffers (a 38,400-byte frame buffer is about 77 KB as hex) out of the conversation. An existing file is replaced only with `overwrite: true`. The path must lie inside the host path root (see "Host files and permissions"). |
 | `hash_memory` | `address`\*, `count`\* (1 to 131072), `space`, `bank`, `algorithm` | CRC32 and/or SHA-256 (`algorithm`: `crc32`, `sha256` or `both`, the default) of a range, read like `read_memory`. Compare a buffer against a known value without transferring it. The CRC32 is the standard one (`zlib.crc32`). |
 | `get_vera_state` | none | VERA's internal state, which the registers at `$9F20-$9F3F` do not show: both data ports at once (address, signed step, increment field, prefetched byte, nibble flags), `addrsel` and `dcsel`, the IRQ enable and status bits, the line-compare value and whether IRQ is asserted, the current raster line, and the FX state (mode, flags, the four cache bytes as hex, pixel increments and positions as decimals plus `_raw` hex, polygon length, affine bases, multiplier accumulator). Reading has no side effects. |
-| `get_screen` | `path`, `overwrite` | 640x480 PNG of the current framebuffer. With `path` it is written to that host file instead of being returned. |
+| `get_screen` | `path`, `overwrite` | 640x480 PNG of the current framebuffer. With `path` it is written to that host file instead of being returned, inside the host path root. |
 
 Example `get_vera_state` result, trimmed (a real run, paused at the BASIC prompt
 after setting ADDR0 to `$11234` with an increment of 1):
@@ -326,8 +356,9 @@ and the `start_command` to use if you did not pass `run`.
   program that is running will crash it, as it would on real hardware.
 - Loads that would overwrite I/O (`$9F00-$9FFF`) or run into ROM are rejected,
   and nothing is changed when a load is rejected. Files up to 1 MB are read.
-- The path is on the machine running the emulator; relative paths are relative
-  to the emulator's working directory, so absolute paths are safest.
+- The path is on the machine running the emulator and must lie inside the host
+  path root (see "Host files and permissions"); relative paths are relative to
+  that root.
 
 ### Mouse
 
@@ -433,6 +464,7 @@ has the helpers (`Emu`, `check`, `wait_screen`, ...).
 | `src/mcp_debug.c` | Breakpoints, watchpoints, stepping and stop state |
 | `src/mcp_json.c` | The JSON parser and writer |
 | `src/mcp_hash.c` | SHA-256 for `hash_memory` (CRC32 comes from zlib) |
+| `src/mcp_paths.c` | The host path policy: root, restriction, `..` handling |
 
 A thread reads and parses requests; each `tools/call` becomes a job that the
 **emulator thread** runs at the top of `emulator_loop`, so tools can touch

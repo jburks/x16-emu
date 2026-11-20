@@ -2,8 +2,9 @@
 import hashlib, json, os, sys, tempfile, time, zlib
 from mcp_testlib import *
 
-tmp = tempfile.mkdtemp(prefix="x16mcp-")
-e = Emu(["-zeroram"])
+tmp = os.path.realpath(tempfile.mkdtemp(prefix="x16mcp-"))
+ROOT_ENV = {"X16EMU_MCP_ROOT": tmp}   # these tests read and write files in their own scratch folder
+e = Emu(["-zeroram"], env=ROOT_ENV)
 names = [t["name"] for t in e.rpc("tools/list")["result"]["tools"]]
 for t in ("hash_memory", "reset", "set_warp"):
     check("tool listed: " + t, t in names)
@@ -67,13 +68,10 @@ check("hash_memory: the maximum count 131,072 works", e.ok("hash_memory", {"spac
 err, t = e.call("read_memory", {"space": "vram", "address": 0, "count": 131073, "path": os.path.join(tmp, "toobig.bin")})
 check("read_memory path: 131,073 is rejected and no file is created", err and not os.path.exists(os.path.join(tmp, "toobig.bin")), t)
 err, t = e.call("hash_memory", {"space": "vram", "address": 0, "count": 131073}); check("hash_memory: 131,073 is rejected", err, t)
-rel = "x16mcp-reltest-%d.bin" % os.getpid()
-relpath = os.path.join(d, rel)                      # the emulator runs with the executable's directory as its working directory
-try:
-    e.ok("read_memory", {"address": 0x400, "count": 9, "path": rel})
-    check("a relative path is relative to the emulator's working directory", os.path.exists(relpath) and open(relpath, "rb").read() == b"123456789")
-finally:
-    if os.path.exists(relpath): os.remove(relpath)
+rel = "reltest.bin"
+relpath = os.path.join(tmp, rel)
+e.ok("read_memory", {"address": 0x400, "count": 9, "path": rel})
+check("a relative path is relative to the host path root", os.path.exists(relpath) and open(relpath, "rb").read() == b"123456789")
 check("cycles is a plain integer (unsigned 64-bit in the server)", isinstance(e.ok("get_registers")["cycles"], int) and e.status()["cycles"] >= 0)
 
 # ---------------- cycle counts ----------------

@@ -2,7 +2,8 @@
 import json, os, struct, sys, tempfile, time
 from mcp_testlib import *
 
-tmp = tempfile.mkdtemp(prefix="x16mcp-")
+tmp = os.path.realpath(tempfile.mkdtemp(prefix="x16mcp-"))
+ROOT_ENV = {"X16EMU_MCP_ROOT": tmp}   # these tests read and write files in their own scratch folder
 def write(name, data):
     path = os.path.join(tmp, name)
     open(path, "wb").write(data)
@@ -22,7 +23,7 @@ PRINT = b"\x99"
 hello = basic_prg([(10, PRINT + b'"HELLO FROM MCP"')])
 ml = struct.pack("<H", 0x0400) + bytes.fromhex("A92A 8D0005 60")        # LDA #$2A / STA $0500 / RTS
 
-e = Emu(["-zeroram"])
+e = Emu(["-zeroram"], env=ROOT_ENV)
 check("load_prg listed", "load_prg" in [t["name"] for t in e.rpc("tools/list")["result"]["tools"]])
 check("boots to READY.", wait_screen(e, "READY."))
 e.ok("pause")
@@ -114,7 +115,7 @@ def with_release(byte):
 for label, byte, expect_name, expect_warn in (("r40 (older)", 40, "r40", True), ("r48 (just older)", 48, "r48", True), ("r49", 49, "r49", False),
                                               ("r50 (newer)", 50, "r50", False), ("custom build ($FF)", 0xFF, "custom build", False),
                                               ("prerelease 48", 0xD0, "prerelease 48", True), ("prerelease 50", 0xCE, "prerelease 50", False)):
-    em = Emu(["-zeroram"], rom=with_release(byte))
+    em = Emu(["-zeroram"], rom=with_release(byte), env=ROOT_ENV)
     wait_screen(em, "READY."); em.ok("pause")
     r = em.ok("load_prg", {"path": write("hello.prg", hello)})
     ok = r["rom_release"] == expect_name and ("warning" in r) == expect_warn and r["basic_pointers"] == "set"
@@ -126,7 +127,7 @@ for label, byte, expect_name, expect_warn in (("r40 (older)", 40, "r40", True), 
     em.close()
 
 # BASIC not booted yet: the start pointer is not there, so no pointers and no run
-em = Emu(["-zeroram"]); em.ok("pause"); em.ok("reset", {"zero_ram": True})
+em = Emu(["-zeroram"], env=ROOT_ENV); em.ok("pause"); em.ok("reset", {"zero_ram": True})
 r = em.ok("load_prg", {"path": write("hello.prg", hello)})
 err, t = em.call("load_prg", {"path": write("hello.prg", hello), "run": True})
 check("before BASIC has initialised: pointers not set, and run is refused", r["basic_pointers"].startswith("not set") and err and "pointers" in t, (r, t))

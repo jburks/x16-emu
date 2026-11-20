@@ -36,6 +36,7 @@
 #include "mcp.h"
 #include "mcp_internal.h"
 #include "mcp_json.h"
+#include "mcp_paths.h"
 #include "version.h"
 
 #define MAX_LINE (16 * 1024 * 1024)
@@ -430,7 +431,9 @@ handle_initialize(const char *id_json, const json_node *params)
 		"accept timeout_ms and leave the emulator paused if it expires. Addresses may be integers or "
 		"strings such as \"$9F20\". The emulator boots to BASIC in about 3-5 s: wait for READY. "
 		"(text layer at VRAM $1B000, 256 bytes per row, character at every other byte) before typing. "
-		"Start with -zeroram for bit-identical runs. Full documentation: MCP.md in the emulator repository.";
+		"Start with -zeroram for bit-identical runs. Host files (load_prg, and the path argument of read_memory and "
+		"get_screen) are limited to one folder: get_status shows it as host_root, and relative paths are relative to it. "
+		"Full documentation: MCP.md in the emulator repository.";
 	json_buf_append_string(&b, instructions, sizeof(instructions) - 1);
 	json_buf_append(&b, "}");
 	send_result(id_json, b.data);
@@ -610,9 +613,12 @@ reader_thread(void *unused)
 	return 0;
 }
 
+extern uint8_t *fsroot_path; // main.c: the -fsroot folder, or NULL
+
 void
 mcp_start(void)
 {
+	mcp_paths_init((const char *)fsroot_path); // decided now, while the working directory is still the start-up one
 	out_lock = SDL_CreateMutex();
 	queue_lock = SDL_CreateMutex();
 	queue_cond = SDL_CreateCond();
