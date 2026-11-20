@@ -241,6 +241,31 @@ How the mouse works on the X16, and what that means for these tools:
 - Moving the real mouse over the emulator window at the same time mixes with
   the injected input.
 
+`load_prg` puts a program on the machine without going through the (emulated)
+disk drive:
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `load_prg` | `path`\*, `address`, `raw`, `bank`, `run` | Loads a PRG file from the host into memory, instantly and without emulated time. The first two bytes of the file are the load address, as with the KERNAL's `LOAD`; `address` overrides it, and `raw: true` treats the whole file as data (`address` required). `bank` selects the RAM bank for loads at `$A000` and up, and data that runs past `$BFFF` continues in the next bank, like the KERNAL. With `run: true` the emulator types `RUN` (BASIC) or `SYS $addr` (machine code). |
+
+The result gives `start`, `end` (exclusive), `bytes`, whether it looks like BASIC,
+and the `start_command` to use if you did not pass `run`.
+
+- A load at `$0801` is treated as a **BASIC program**. BASIC's end-of-program
+  pointers are updated the way the `LOAD` command does, otherwise BASIC would
+  store variables on top of the program. Those pointers live at ROM-specific
+  addresses, so this is done only for ROM releases the tool knows (currently
+  R49). On any other release the result says `basic_pointers: "not set"` and
+  `run: true` is refused for BASIC programs; load without `run` and start it by
+  hand, or use `type_text` with `LOAD`.
+- `run: true` types into the KERNAL keyboard buffer, so it needs the emulator
+  running at the BASIC prompt. Loading over a program that is running will
+  crash it, as it would on real hardware.
+- Loads that would overwrite I/O (`$9F00-$9FFF`) or run into ROM are rejected,
+  and nothing is changed when a load is rejected. Files up to 1 MB are read.
+- The path is on the machine running the emulator; relative paths are relative
+  to the emulator's working directory, so absolute paths are safest.
+
 `type_text` is the easy way to enter BASIC lines and commands. Programs that
 read the keyboard directly bypass the KERNAL buffer; use `send_key` for those.
 
@@ -273,8 +298,9 @@ To test a small routine without a build step:
 ## Limitations
 
 - No watchpoints on VRAM addresses, no data-dependent conditions on breakpoints.
-- No tool for loading a PRG file into memory. Pass `-prg` / `-run` on the
-  command line, or use `type_text` with `LOAD`.
+- `load_prg` knows BASIC's pointer layout only for the ROM releases listed in
+  `basic_layouts` in `src/mcp_tools.c`; other releases load fine but need the
+  BASIC program started by hand.
 - No audio inspection, and no joystick input.
 - Requests are handled serially (see above).
 - Closing the emulator window ends the session (a `-nowindow` emulator has none; it ends when the client closes it).

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <SDL.h>
 #include "glue.h"
 #include "memory.h"
@@ -937,6 +938,24 @@ static const mcp_tool tool_send_key = {
 	cancel_key
 };
 
+// Queues text to be typed into the KERNAL keyboard buffer. Returns NULL on success, else an error message.
+static const char *
+queue_typed(const char *text, size_t len)
+{
+	if (pasting_bas || paste_text) {
+		return "a previous text is still being typed";
+	}
+	char *copy = SDL_malloc(len + 1);
+	if (!copy) {
+		return "out of memory";
+	}
+	for (size_t i = 0; i <= len; i++) {
+		copy[i] = text[i] == '\n' ? '\r' : text[i]; // the X16 Enter key is CR
+	}
+	machine_paste(copy, true); // typed into the KERNAL keyboard buffer as the program runs
+	return NULL;
+}
+
 static bool
 run_type_text(mcp_job *job)
 {
@@ -949,23 +968,15 @@ run_type_text(mcp_job *job)
 		}
 		const json_node *w = json_get(job->args, "wait");
 		bool wait = w && w->type == JSON_BOOL && w->boolean;
-		if (pasting_bas || paste_text) {
-			mcp_job_fail(job, "a previous text is still being typed");
-			return true;
-		}
-		if (wait && mcp_is_paused()) {
+		if (wait && mcp_is_paused() && !pasting_bas) {
 			mcp_job_fail(job, "wait=true needs the emulator running (typing only progresses while it runs)");
 			return true;
 		}
-		char *copy = SDL_malloc(tn->string_len + 1);
-		if (!copy) {
-			mcp_job_fail(job, "out of memory");
+		const char *err = queue_typed(text, tn->string_len);
+		if (err) {
+			mcp_job_fail(job, err);
 			return true;
 		}
-		for (size_t i = 0; i <= tn->string_len; i++) {
-			copy[i] = text[i] == '\n' ? '\r' : text[i]; // the X16 Enter key is CR
-		}
-		machine_paste(copy, true); // typed into the KERNAL keyboard buffer as the program runs
 		if (!wait) {
 			json_buf_append(&job->text, "{\"queued\":true}");
 			return true;
@@ -989,6 +1000,213 @@ static const mcp_tool tool_type_text = {
 	"{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"wait\":{\"type\":\"boolean\",\"default\":false},"
 	"\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600000}},\"required\":[\"text\"],\"additionalProperties\":false}",
 	run_type_text,
+	0,
+	NULL
+};
+
+// ---- load_prg ----
+
+// Where BASIC keeps its program-end pointers, per KERNAL release (the byte at $FF80). Real LOAD sets all
+// three to the end address; without that, BASIC would put variables on top of the loaded program.
+typedef struct { int8_t release; uint16_t txttab, vartab, arytab, strend; } basic_layout_t;
+static const basic_layout_t basic_layouts[] = {
+	{ 49, 0x00DF, 0x03E1, 0x03E3, 0x03E5 },
+};
+
+static bool
+run_load_prg(mcp_job *job)
+{
+	const char *path = json_as_string(json_get(job->args, "path"));
+	if (!path || !path[0]) {
+		mcp_job_fail(job, "path is required: the PRG file on the host (an absolute path is safest)");
+		return true;
+	}
+	const json_node *rawn = json_get(job->args, "raw");
+	const json_node *runn = json_get(job->args, "run");
+	if ((rawn && rawn->type != JSON_BOOL) || (runn && runn->type != JSON_BOOL)) {
+		mcp_job_fail(job, "raw and run must be true or false");
+		return true;
+	}
+	bool raw = rawn && rawn->boolean, run = runn && runn->boolean;
+	uint32_t override = 0, bank = 0;
+	bool have_addr = json_get(job->args, "address") != NULL;
+	bool have_bank = json_get(job->args, "bank") != NULL;
+	if (have_addr && (!arg_uint(job, "address", &override) || override > 0xFFFF)) {
+		mcp_job_fail(job, "address must be 0 to 0xFFFF as an integer or a string like \"0x0801\"");
+		return true;
+	}
+	if (raw && !have_addr) {
+		mcp_job_fail(job, "raw files have no load address in them: pass address");
+		return true;
+	}
+	if (have_bank && (!arg_uint(job, "bank", &bank) || bank >= num_ram_banks)) {
+		mcp_job_fail(job, "bank must be a valid RAM bank number");
+		return true;
+	}
+
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		char msg[600];
+		snprintf(msg, sizeof(msg), "cannot open %.400s: %s", path, strerror(errno));
+		mcp_job_fail(job, msg);
+		return true;
+	}
+	enum { MAX_PRG = 0x100000 };
+	uint8_t *file = malloc(MAX_PRG + 1);
+	size_t n = file ? fread(file, 1, MAX_PRG + 1, f) : 0;
+	bool read_err = ferror(f);
+	fclose(f);
+	const char *fail = NULL;
+	if (!file) fail = "out of memory";
+	else if (read_err) fail = "error reading the file (is it a directory?)";
+	else if (n > MAX_PRG) fail = "file is larger than 1 MB";
+	if (fail) {
+		free(file);
+		mcp_job_fail(job, fail);
+		return true;
+	}
+
+	const uint8_t *data = file;
+	size_t len = n;
+	uint32_t start;
+	if (raw) {
+		start = override;
+	} else {
+		if (n < 3) {
+			free(file);
+			mcp_job_fail(job, "not a PRG: it needs a 2-byte load address followed by at least one byte of data");
+			return true;
+		}
+		start = have_addr ? override : (uint32_t)(file[0] | file[1] << 8);
+		data += 2;
+		len -= 2;
+	}
+	if (len == 0) {
+		free(file);
+		mcp_job_fail(job, "the file has no data");
+		return true;
+	}
+	if (have_bank && start < 0xA000) {
+		free(file);
+		mcp_job_fail(job, "bank only applies to load addresses from $A000 up");
+		return true;
+	}
+
+	// Check the whole destination before touching anything. Low RAM ends at $9EFF; banked RAM is
+	// $A000-$BFFF and, as with the KERNAL's LOAD, continues in the next bank after $BFFF.
+	uint32_t a = start, b = have_bank ? bank : (uint32_t)memory_get_ram_bank();
+	for (size_t i = 0; i < len; i++) {
+		if (a >= 0xA000 && a < 0xC000) {
+			if (b >= num_ram_banks) {
+				fail = "the data runs past the last RAM bank";
+				break;
+			}
+		} else if (a >= 0x9F00) {
+			fail = a < 0xA000 ? "the data would overwrite the I/O area ($9F00-$9FFF)"
+			                  : "the data would run into ROM ($C000 and up)";
+			break;
+		}
+		if (++a == 0xC000 && start >= 0xA000) {
+			a = 0xA000;
+			b++;
+		}
+	}
+	if (fail) {
+		free(file);
+		mcp_job_fail(job, fail);
+		return true;
+	}
+	uint32_t end = a & 0xFFFF; // exclusive; after a bank wrap this is the address in the last bank
+
+	// BASIC program? Then BASIC's pointers must move with it, as the LOAD command does.
+	bool basic = start == 0x0801 && !have_bank;
+	int rel = debug_read6502(0xFF80, 0, 0);
+	const char *ptr_status = "n/a";
+	int layout = -1;
+	if (basic) {
+		for (size_t i = 0; i < sizeof(basic_layouts) / sizeof(basic_layouts[0]); i++) {
+			if (basic_layouts[i].release == (int8_t)rel) layout = (int)i;
+		}
+		if (layout >= 0 && (RAM[basic_layouts[layout].txttab] | RAM[basic_layouts[layout].txttab + 1] << 8) != 0x0801) {
+			layout = -1; // BASIC's start-of-program pointer is not where we expect it
+		}
+		ptr_status = layout >= 0 ? "set" : "not set (unknown ROM release)";
+	}
+	if (run && basic && layout < 0) {
+		free(file);
+		mcp_job_fail(job, "cannot run a BASIC program on this ROM release: BASIC's pointers are unknown, so variables "
+		                  "would overwrite the program. Load without run and start it yourself");
+		return true;
+	}
+	char cmd[32] = "";
+	if (run) {
+		snprintf(cmd, sizeof(cmd), basic ? "RUN\n" : "SYS $%04X\n", start);
+		const char *err = queue_typed(cmd, strlen(cmd));
+		if (err) {
+			free(file);
+			mcp_job_fail(job, err);
+			return true;
+		}
+	}
+
+	a = start;
+	b = have_bank ? bank : (uint32_t)memory_get_ram_bank();
+	for (size_t i = 0; i < len; i++) {
+		if (a < 0x9F00) {
+			RAM[a] = data[i];
+		} else {
+			BRAM[((size_t)b << 13) + a - 0xA000] = data[i];
+		}
+		if (++a == 0xC000 && start >= 0xA000) {
+			a = 0xA000;
+			b++;
+		}
+	}
+	free(file);
+	if (layout >= 0) {
+		const basic_layout_t *l = &basic_layouts[layout];
+		uint16_t ptrs[3] = { l->vartab, l->arytab, l->strend };
+		for (int i = 0; i < 3; i++) {
+			RAM[ptrs[i]] = (uint8_t)end;
+			RAM[ptrs[i] + 1] = (uint8_t)(end >> 8);
+		}
+	}
+
+	char tmp[320];
+	snprintf(tmp, sizeof(tmp),
+	         "{\"start\":\"0x%04X\",\"end\":\"0x%04X\",\"bytes\":%zu,\"basic\":%s,\"basic_pointers\":\"%s\","
+	         "\"started\":%s,\"start_command\":\"",
+	         start, end, len, basic ? "true" : "false", ptr_status, run ? "true" : "false");
+	json_buf_append(&job->text, tmp);
+	if (basic) {
+		json_buf_append(&job->text, "RUN");
+	} else {
+		snprintf(tmp, sizeof(tmp), "SYS $%04X", start);
+		json_buf_append(&job->text, tmp);
+	}
+	json_buf_append(&job->text, "\"}");
+	return true;
+}
+
+static const mcp_tool tool_load_prg = {
+	"load_prg",
+	"Loads a PRG file from the host into emulated memory, instantly and without emulated time (nothing else is "
+	"disturbed, so runs stay deterministic). The first two bytes of the file are the load address, as with the "
+	"KERNAL's LOAD; `address` overrides it, and `raw` treats the whole file as data (then `address` is required). "
+	"`bank` selects the RAM bank for loads at $A000 and up (default: the current one); like the KERNAL, data that "
+	"runs past $BFFF continues in the next bank. A load at $0801 is taken to be a BASIC program, and BASIC's "
+	"program-end pointers are set as the LOAD command would (supported ROM releases only; the result says whether "
+	"they were set). With run=true the emulator is told to start it by typing RUN (BASIC) or SYS <address> (machine "
+	"code), which needs the emulator running at the BASIC prompt. Do not load while another program is running "
+	"unless you mean to overwrite it. Returns the start, the end (exclusive) and the size.",
+	"{\"type\":\"object\",\"properties\":{"
+		"\"path\":{\"type\":\"string\",\"description\":\"host file path\"},"
+		"\"address\":{\"type\":[\"integer\",\"string\"],\"description\":\"load address, overriding the file's\"},"
+		"\"raw\":{\"type\":\"boolean\",\"default\":false,\"description\":\"file has no 2-byte load address\"},"
+		"\"bank\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255},"
+		"\"run\":{\"type\":\"boolean\",\"default\":false}},"
+	 "\"required\":[\"path\"],\"additionalProperties\":false}",
+	run_load_prg,
 	0,
 	NULL
 };
@@ -1333,7 +1551,7 @@ static const mcp_tool tool_debug_stall = {
 const mcp_tool *const *
 mcp_tool_table(void)
 {
-	static const mcp_tool *table[28];
+	static const mcp_tool *table[32];
 	if (!table[0]) {
 		size_t n = 0;
 		table[n++] = &tool_get_registers;
@@ -1354,6 +1572,7 @@ mcp_tool_table(void)
 		table[n++] = &tool_set_registers;
 		table[n++] = &tool_send_key;
 		table[n++] = &tool_type_text;
+		table[n++] = &tool_load_prg;
 		table[n++] = &tool_mouse_move;
 		table[n++] = &tool_mouse_button;
 		table[n++] = &tool_mouse_wheel;
