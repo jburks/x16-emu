@@ -18,7 +18,9 @@
 // A job that completes in a single pass cannot time out once it has started.
 
 #ifndef _WIN32
+#ifndef _POSIX_C_SOURCE // the build may already define it (a different value is an error under -Werror)
 #define _POSIX_C_SOURCE 200809L // fdopen
+#endif
 #endif
 #include <stdio.h>
 #include <stdlib.h>

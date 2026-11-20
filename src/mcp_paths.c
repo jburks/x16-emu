@@ -3,7 +3,9 @@
 // All rights reserved. License: 2-clause BSD
 
 #ifndef __APPLE__
+#ifndef _XOPEN_SOURCE // the build may already define it (a different value is an error under -Werror)
 #define _XOPEN_SOURCE 700
+#endif
 #endif
 #include <stdio.h>
 #include <stdlib.h>
