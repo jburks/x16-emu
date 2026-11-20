@@ -76,6 +76,28 @@ check("with transparent writes a skipped (zero) cache byte is not a write: no hi
 e.ok("clear_watchpoint", {"all": True}); e.ok("set_watchpoint", {"space": "vram", "address": 0x0A002}); run_from(0x0600)
 r = cont(); check("...while the byte that is written still fires", r["stopped"] == "watchpoint" and r["address"] == "0x0A002" and r["value"] == "0x33", r)
 
+# ---- FX cache writes: which four bytes? The group at or below the data port's address (before it auto-increments) ----
+def prog_fx(lo):
+    return ("A900 8D259F A9%02X 8D209F A9A0 8D219F A910 8D229F "        # ADDR0 = $0A0<lo>, increment 1
+            "A90C 8D259F A911 8D299F A922 8D2A9F A933 8D2B9F A944 8D2C9F "   # DCSEL 6: the four cache bytes
+            "A904 8D259F A940 8D299F A900 8D239F " % lo) + spin(0x0630)      # DCSEL 2: cache_write; one store through DATA0
+ok = True
+for lo in range(8):
+    prog(0x0600, prog_fx(lo)); e.ok("clear_watchpoint", {"all": True})
+    for byte in range(0x0A000 - 1, 0x0A009):
+        e.ok("set_watchpoint", {"space": "vram", "address": byte})
+    e.ok("write_memory", {"space": "vram", "address": 0xA000, "hex": "00" * 8}); run_from(0x0600)
+    r = e.ok("run_frames", {"frames": 2, "timeout_ms": 20000})
+    hits = {int(w["address"], 16): w["hits"] for w in e.ok("list_watchpoints")}
+    group = 0x0A000 + (lo & ~3)
+    want = {b: 1 if group <= b < group + 4 else 0 for b in range(0x0A000 - 1, 0x0A009)}
+    stored = e.ok("read_memory", {"space": "vram", "address": 0xA000, "count": 8})["hex"]
+    exp = ("00" * (lo & ~3)) + "11223344" + ("00" * (4 - (lo & ~3)))
+    if hits != want or stored != exp:
+        ok = False; print("  mismatch for data port address $0A00%d: hits %s stored %s (expected group $%05X)" % (lo, {hex(k): v for k, v in hits.items() if v}, stored, group))
+check("an FX cache write at $0A000..$0A007 stores the 4-byte group at or below the address: each of 9 single-byte watches hits exactly for its bytes", ok)
+e.ok("clear_watchpoint", {"all": True})
+
 # ---- argument validation ----
 for label, a in (("a read watch on vram", {"space": "vram", "address": 0, "access": "read"}), ("readwrite on vram", {"space": "vram", "address": 0, "access": "readwrite"}),
                  ("a bank with vram", {"space": "vram", "address": 0, "bank": 1}), ("address past VRAM", {"space": "vram", "address": 0x20000}),
@@ -114,5 +136,21 @@ prog(0x0710, "BDFF03 EA"); e.ok("set_registers", {"pc": 0x0710, "x": 1})
 e.ok("set_watchpoint", {"address": 0x03FF, "length": 2, "access": "read", "exclude_fetch": True})
 r = e.ok("step"); h = e.ok("list_watchpoints")[0]["hits"]
 check("LDA $03FF,X across a page boundary is one data read (hits=%d)" % h, r["stopped"] == "watchpoint" and r["address"] == "0x0400" and h == 1, (r, h))
+# more addressing modes: every access is reported once (read-modify-write = one read + one write)
+def accesses(code, setup, watch_addr, pc=0x0720):
+    prog(pc, code); e.ok("clear_watchpoint", {"all": True})
+    for k, v in setup.items(): e.ok("write_memory", {"address": k, "hex": v})
+    e.ok("set_watchpoint", {"address": watch_addr, "access": "readwrite"})
+    e.ok("set_registers", {"pc": pc, "status": 0x24, "x": 1, "y": 1}); e.ok("step")
+    return e.ok("list_watchpoints")[0]["hits"]
+for label, code, setup, addr, want in (("INC abs (read-modify-write)", "EE0004 EA", {}, 0x0400, 2),
+                                        ("INC abs,X crossing a page", "FEFF03 EA", {}, 0x0400, 2),
+                                        ("LDA (zp),Y crossing a page", "B120 EA", {0x20: "FF03"}, 0x0400, 1),
+                                        ("STA (zp),Y crossing a page", "9120 EA", {0x20: "FF03"}, 0x0400, 1),
+                                        ("LDA abs,X crossing a page", "BDFF03 EA", {}, 0x0400, 1),
+                                        ("STA abs,X crossing a page", "9DFF03 EA", {}, 0x0400, 1),
+                                        ("ASL zp (read-modify-write)", "0610 EA", {}, 0x0010, 2)):
+    h = accesses(code, setup, addr, 0x0720)
+    check("%s: %d access(es) reported (hits=%d)" % (label, want, h), h == want, h)
 check("emulator exits cleanly", e.close() == 0)
 finish()

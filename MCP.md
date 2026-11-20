@@ -310,12 +310,21 @@ again. Resuming after a watchpoint hit does not re-trigger it.
 - **Instruction fetches count as reads**, so a read watch on code fires when it
   executes, and so does a read watch on data that sits next to code. Pass
   `exclude_fetch: true` to ignore reads of the bytes of the instruction being
-  executed (its opcode and operands). That is a heuristic: it treats a read
-  within four bytes of the opcode's address as a fetch, so the only miss is an
-  instruction that deliberately reads its own bytes as data.
-- The emulator does not issue the extra "dummy" reads that some real 65C02
-  addressing modes make (read-modify-write instructions and page-crossing
-  indexed loads each read once), so none are reported.
+  executed (its opcode and operands). That is a heuristic, and it has
+  limits: it treats a read at the opcode's address or within the next three bytes
+  as a fetch, whatever the instruction's real length (the window is four bytes
+  to cover the 65C816's longest instruction). So a data read can be hidden when
+  it lands inside that window: a lookup table placed directly behind the
+  instruction that reads it (`LDA table,X` with `table` at the next byte, `X`
+  = 0), an instruction that reads its own bytes as data, or code that runs from
+  the zero page or stack and reads data within four bytes of itself. Moving the
+  table a few bytes away avoids it.
+- The CPU core does not model the extra "dummy" reads that some real 65C02
+  addressing modes make, so none are reported. The tests confirm one access per
+  operand for: `INC`/`ASL` (read-modify-write: one read plus one write, so a
+  `readwrite` watch counts 2), absolute, indexed and `(zp),Y` loads and stores,
+  each also when the index crosses a page. Other addressing modes have not been
+  tested individually.
 - A write through the VERA data port shows up here as an access to `$9F23` or
   `$9F24`, not as a VRAM address. Use a VRAM watchpoint for that.
 
@@ -326,9 +335,12 @@ again. Resuming after a watchpoint hit does not re-trigger it.
   `value` now stored there, `data_port` (0 for `$9F23`, 1 for `$9F24`) and
   `accessing_pc`. Writes through either data port are covered, including ones
   made while FX is active.
-- One CPU store can write several bytes. An FX cache write stores up to four
-  (starting at the 4-byte boundary below the data port's address), and a 4-bit
-  write changes only half a byte. A hit is reported if **any byte the store
+- One CPU store can write several bytes. An FX cache write stores up to four:
+  the aligned group of four bytes at or below the address the data port held
+  **before** the access (before it auto-increments), so from `$0A001`,
+  `$0A002` or `$0A003` the group is `$0A000-$0A003`. The tests check every
+  offset from `$0A000` to `$0A007` with a watchpoint on each neighbouring byte.
+  A 4-bit write changes only half a byte. A hit is reported if **any byte the store
   writes** lies in the range, even when the CPU's own address does not. A store
   that FX skips (a transparent write of zero, or a nibble masked out) is not a
   write. The reported value is the whole byte as it is now in VRAM.
@@ -417,6 +429,11 @@ Once symbols are loaded:
   for the current RAM or ROM bank (or without a bank) are used. Linker symbols
   whose names start and end with `__` (such as `__BSS_SIZE__`) are never offered
   when naming an address, since they are sizes and limits, not code.
+- `symbol` is not limited to code: a label that names a lookup table or a
+  zero-page variable is reported the same way, so `"symbol": "sine_table+0x10"`
+  in a result for a data address is a position in the table, not an instruction.
+  (Stop results name `pc`, which is code; `lookup_symbol` and the watchpoint
+  addresses can be data.)
 - Only the **ca65/ld65 label format** is read. Debug-info (`.dbg`) and map files
   are not.
 
