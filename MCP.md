@@ -3,7 +3,7 @@
 The emulator can run as an [MCP](https://modelcontextprotocol.io) (Model Context
 Protocol) server, so an AI agent or any other MCP client can inspect and drive a
 running Commander X16: read memory and the screen, pause, single-step, set
-breakpoints and watchpoints, poke memory, and type on the keyboard.
+breakpoints and watchpoints, poke memory, and type on the keyboard or move the mouse.
 
 Start the emulator with `-mcp`. The normal emulator window opens, and the
 emulator then speaks MCP on its standard input and output. There are no extra
@@ -192,6 +192,37 @@ Watchpoint limits to know about:
 | `send_key` | `key`\*, `action`, `hold_frames`, `timeout_ms` | Sends a key to the emulated PS/2 keyboard. `key` is an [SDL key name](https://wiki.libsdl.org/SDL2/SDL_Scancode) (`Return`, `A`, `Space`, `Left`, `F5`, `Left Shift`, ...). `action` is `tap` (default), `down` or `up`. `hold_frames` keeps a tapped key down for that many frames; use it for programs that poll key state (needs the emulator running). |
 | `type_text` | `text`\*, `wait`, `timeout_ms` | Types into the KERNAL keyboard buffer. `\n` is Enter. If the emulator is paused the text is queued and typed after `continue`. With `wait: true` it returns when everything is typed, not when the program it started finishes. |
 
+### Mouse
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `mouse_move` | `dx`/`dy`, or `x` and `y` | Relative move (`dx`, `dy` up to 4096; +x right, +y down), or absolute move to `x`,`y` (0 to 1023) |
+| `mouse_button` | `button`, `action`, `hold_frames` | `button` is `left` (default), `right` or `middle`. `action` is `tap` (default), `down` or `up`; use `down` and `up` around `mouse_move` to drag. A tap holds the button for `hold_frames` frames (default 2 while running, 0 while paused). |
+| `mouse_wheel` | `notches`\* | Scrolls up (positive) or down (negative) |
+
+How the mouse works on the X16, and what that means for these tools:
+
+- The X16 mouse is a PS/2 mouse that reports **relative movement only**. The
+  KERNAL keeps the pointer position, and only after the program has enabled the
+  mouse (in BASIC: `MOUSE 1`; then `MX`, `MY` and `MB` read the position and
+  buttons). Until then, nothing consumes the movement.
+- An **absolute move** is emulated: the pointer is driven into the top-left
+  corner (the KERNAL clamps it there) and then out to `x`,`y`. That relies on
+  the KERNAL mouse being enabled at its default 1:1 scale. If a program
+  configures a different scale, or reads the mouse hardware itself, use
+  relative moves and track the position yourself.
+- Movement is delivered a packet at a time as the program reads it, so a long
+  move takes a few frames and needs the emulator **running**. The reply says
+  `consumed: true` once the program has read everything. With the emulator
+  paused, only about three packets (roughly 700 units) fit; a bigger move fails
+  with a message telling you to continue and repeat.
+- If nothing reads the mouse for about 1.5 seconds of emulated time, the call
+  fails with "the program is not consuming mouse data".
+- Wheel events need the wheel mode (PS/2 IntelliMouse) to have been enabled by
+  the program or KERNAL; otherwise `mouse_wheel` returns an error.
+- Moving the real mouse over the emulator window at the same time mixes with
+  the injected input.
+
 `type_text` is the easy way to enter BASIC lines and commands. Programs that
 read the keyboard directly bypass the KERNAL buffer; use `send_key` for those.
 
@@ -226,7 +257,7 @@ To test a small routine without a build step:
 - No watchpoints on VRAM addresses, no data-dependent conditions on breakpoints.
 - No tool for loading a PRG file into memory. Pass `-prg` / `-run` on the
   command line, or use `type_text` with `LOAD`.
-- No audio inspection, and no mouse or joystick input.
+- No audio inspection, and no joystick input.
 - Requests are handled serially (see above).
 - The emulator window must stay open: closing it ends the session.
 

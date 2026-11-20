@@ -326,6 +326,13 @@ mouse_send(int x, int y, int b, uint8_t w)
 	}
 }
 
+// True if a packet of any size fits in the mouse buffer, i.e. it will not be dropped.
+bool
+mouse_has_room(void)
+{
+	return i2c_mse_buffer_count() < MSE_SIZE - 4;
+}
+
 void
 mouse_send_state(void)
 {

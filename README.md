@@ -48,7 +48,7 @@ You can build a ROM image yourself using the [build instructions][x16rom-build] 
 
 ### MCP Server
 
-With `-mcp` the emulator can be inspected and driven by an AI agent or other MCP client (memory, screen, breakpoints, watchpoints, stepping, keyboard). See [MCP.md](MCP.md).
+With `-mcp` the emulator can be inspected and driven by an AI agent or other MCP client (memory, screen, breakpoints, watchpoints, stepping, keyboard, mouse). See [MCP.md](MCP.md).
 
 ### macOS Build
 

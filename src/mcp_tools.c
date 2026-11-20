@@ -10,6 +10,7 @@
 #include "memory.h"
 #include "video.h"
 #include "keyboard.h"
+#include "i2c.h"
 #include "cpu/fake6502.h"
 #include "mcp.h"
 #include "mcp_internal.h"
@@ -992,6 +993,310 @@ static const mcp_tool tool_type_text = {
 	NULL
 };
 
+// ---- mouse ----
+// The X16 mouse is a PS/2 mouse: it reports relative movement, and the KERNAL
+// keeps the pointer position (when a program enables it, e.g. BASIC "MOUSE 1").
+
+static int32_t pk_lo(uint64_t v) { return (int32_t)(uint32_t)v; }
+static int32_t pk_hi(uint64_t v) { return (int32_t)(uint32_t)(v >> 32); }
+static uint64_t pk(int32_t a, int32_t b) { return (uint64_t)(uint32_t)a | (uint64_t)(uint32_t)b << 32; }
+
+static int32_t
+clamp255(int32_t v)
+{
+	return v > 255 ? 255 : v < -255 ? -255 : v;
+}
+
+// Reads a signed integer argument; returns false if absent or not an integer in [lo, hi].
+static bool
+arg_int(const mcp_job *job, const char *name, int32_t lo, int32_t hi, int32_t *out)
+{
+	const json_node *n = json_get(job->args, name);
+	if (!n || n->type != JSON_NUMBER || n->number != (double)(int32_t)n->number
+	    || n->number < lo || n->number > hi) {
+		return false;
+	}
+	*out = (int32_t)n->number;
+	return true;
+}
+
+// Jobs run one at a time, so the mouse tools can share this: the frame at which they last made progress.
+static uint32_t mouse_progress;
+#define MOUSE_STALL_FRAMES 90
+static bool
+mouse_stalled(void)
+{
+	return (int32_t)(frames - mouse_progress) > MOUSE_STALL_FRAMES;
+}
+static const char mouse_stall_msg[] =
+	"the program is not consuming mouse data (is the mouse enabled? in BASIC: MOUSE 1); part of it may have been delivered";
+// Waits (only while running) until the program has read everything queued, so that on return the
+// KERNAL's pointer position and button state are up to date. Returns true when it is time to answer.
+static bool
+mouse_drained(void)
+{
+	return mcp_is_paused() || i2c_mse_buffer_count() == 0 || mouse_stalled();
+}
+
+static bool
+run_mouse_move(mcp_job *job)
+{
+	if (job->polls == 0) {
+		mouse_progress = frames;
+		int32_t dx = 0, dy = 0, x = 0, y = 0;
+		bool have_d = json_get(job->args, "dx") || json_get(job->args, "dy");
+		bool have_abs = json_get(job->args, "x") || json_get(job->args, "y");
+		if (have_d == have_abs) {
+			mcp_job_fail(job, "pass either dx and/or dy (relative), or x and y (absolute), not both and not neither");
+			return true;
+		}
+		if (have_d) {
+			if ((json_get(job->args, "dx") && !arg_int(job, "dx", -4096, 4096, &dx))
+			    || (json_get(job->args, "dy") && !arg_int(job, "dy", -4096, 4096, &dy))) {
+				mcp_job_fail(job, "dx and dy must be integers from -4096 to 4096");
+				return true;
+			}
+			job->scratch[0] = pk(dx, dy);
+			job->scratch[1] = 0;
+		} else {
+			if (!arg_int(job, "x", 0, 1023, &x) || !arg_int(job, "y", 0, 1023, &y)) {
+				mcp_job_fail(job, "absolute moves need both x and y, integers from 0 to 1023");
+				return true;
+			}
+			// Drive the pointer into the top-left corner (the KERNAL clamps it there), then out to x,y.
+			job->scratch[0] = pk(-1024, -1024);
+			job->scratch[1] = pk(x, y);
+		}
+	}
+	int32_t dx = pk_lo(job->scratch[0]), dy = pk_hi(job->scratch[0]);
+	for (;;) {
+		if (dx == 0 && dy == 0) {
+			if (job->scratch[1] == 0) {
+				if (!mouse_drained()) {
+					job->scratch[0] = 0;
+					return false;
+				}
+				json_buf_append(&job->text, i2c_mse_buffer_count() ? "{\"moved\":true,\"consumed\":false}" : "{\"moved\":true,\"consumed\":true}");
+				return true;
+			}
+			dx = pk_lo(job->scratch[1]);
+			dy = pk_hi(job->scratch[1]);
+			job->scratch[1] = 0;
+			continue;
+		}
+		if (!mouse_has_room()) {
+			if (mcp_is_paused()) {
+				mcp_job_fail(job, "the mouse buffer is full and the emulator is paused, so the program cannot consume "
+				                  "it; continue (or run_frames) and repeat. Part of the move was already delivered");
+				return true;
+			}
+			if (mouse_stalled()) {
+				mcp_job_fail(job, mouse_stall_msg);
+				return true;
+			}
+			job->scratch[0] = pk(dx, dy);
+			return false;
+		}
+		mouse_progress = frames;
+		int32_t cx = clamp255(dx), cy = clamp255(dy);
+		mouse_move(cx, cy);
+		mouse_send_state();
+		dx -= cx;
+		dy -= cy;
+	}
+}
+
+static const mcp_tool tool_mouse_move = {
+	"mouse_move",
+	"Moves the PS/2 mouse. The X16 mouse reports only relative movement and the KERNAL tracks the pointer, so the "
+	"program must have enabled it (in BASIC: MOUSE 1; then MX, MY and MB read it back). Pass dx and/or dy (screen "
+	"pixels in mouse units, +x right, +y down) for a relative move, or x and y (0-1023) to go to an absolute "
+	"position. An absolute move first drives the pointer into the top-left corner and then out to x,y, which "
+	"assumes the KERNAL mouse is enabled with its default scale (1:1) and clamps at the screen edge. Movement is "
+	"delivered a packet at a time as the program consumes it, so a long move needs the emulator running; with it "
+	"paused only about three packets (roughly 700 units) can be queued.",
+	"{\"type\":\"object\",\"properties\":{"
+		"\"dx\":{\"type\":\"integer\",\"minimum\":-4096,\"maximum\":4096},"
+		"\"dy\":{\"type\":\"integer\",\"minimum\":-4096,\"maximum\":4096},"
+		"\"x\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":1023},"
+		"\"y\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":1023},"
+		"\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600000}},\"additionalProperties\":false}",
+	run_mouse_move,
+	0,
+	NULL
+};
+
+// scratch[0] = release deadline frame, scratch[1] = button | phase << 8 | hold_only << 16
+// phases: 0 press, 1 hold, 2 release
+static void
+cancel_mouse_button(mcp_job *job)
+{
+	mouse_button_up((int)(job->scratch[1] & 0xFF)); // never leave a button stuck down
+	if (mouse_has_room()) {
+		mouse_send_state();
+	}
+}
+
+static bool
+run_mouse_button(mcp_job *job)
+{
+	if (job->polls == 0) {
+		const char *b = json_as_string(json_get(job->args, "button"));
+		int button = !b || !strcmp(b, "left") ? 0 : !strcmp(b, "right") ? 1 : !strcmp(b, "middle") ? 2 : -1;
+		if (button < 0) {
+			mcp_job_fail(job, "button must be \"left\", \"right\" or \"middle\"");
+			return true;
+		}
+		const json_node *an = json_get(job->args, "action");
+		const char *action = an ? json_as_string(an) : "tap";
+		int act = !action ? -1 : !strcmp(action, "tap") ? 0 : !strcmp(action, "down") ? 1 : !strcmp(action, "up") ? 2 : -1;
+		if (act < 0) {
+			mcp_job_fail(job, "action must be \"tap\", \"down\" or \"up\"");
+			return true;
+		}
+		uint32_t hold = mcp_is_paused() ? 0 : 2; // a program polling once per frame needs the button to span a frame
+		if (json_get(job->args, "hold_frames") && (!arg_uint(job, "hold_frames", &hold) || hold > 100000)) {
+			mcp_job_fail(job, "hold_frames must be an integer from 0 to 100000");
+			return true;
+		}
+		if (act == 0 && hold > 0 && mcp_is_paused()) {
+			mcp_job_fail(job, "hold_frames needs the emulator running (time does not pass while paused)");
+			return true;
+		}
+		// the phase to start in, and whether to stop after pressing
+		unsigned phase = act == 2 ? 2 : 0;
+		job->scratch[1] = (uint64_t)button | (uint64_t)phase << 8 | (uint64_t)(act == 1) << 16;
+		job->scratch[0] = hold;
+		mouse_progress = frames;
+	}
+	int button = (int)(job->scratch[1] & 0xFF);
+	unsigned phase = (unsigned)(job->scratch[1] >> 8) & 0xFF;
+	bool press_only = (job->scratch[1] >> 16) & 1;
+	for (;;) {
+		if (phase == 3) { // everything is queued; wait for the program to read it
+			if (!mouse_drained()) {
+				break;
+			}
+			json_buf_append(&job->text, i2c_mse_buffer_count() ? "{\"queued\":true,\"consumed\":false}" : "{\"queued\":true,\"consumed\":true}");
+			return true;
+		}
+		if (phase == 1) {
+			if ((int32_t)(frames - (uint32_t)job->scratch[0]) < 0) {
+				break;
+			}
+			phase = 2;
+		}
+		if (!mouse_has_room()) {
+			if (mcp_is_paused()) {
+				if (phase == 2) {
+					mouse_button_up(button);
+				}
+				mcp_job_fail(job, "the mouse buffer is full and the emulator is paused; continue and repeat");
+				return true;
+			}
+			if (mouse_stalled()) {
+				if (phase == 2) {
+					mouse_button_up(button);
+				}
+				mcp_job_fail(job, mouse_stall_msg);
+				return true;
+			}
+			break;
+		}
+		if (phase == 0) {
+			mouse_button_down(button);
+			mouse_send_state();
+			mouse_progress = frames;
+			if (press_only) {
+				phase = 3;
+				continue;
+			}
+			uint32_t hold = (uint32_t)job->scratch[0];
+			job->scratch[0] = (uint32_t)(frames + hold);
+			phase = hold ? 1 : 2;
+		} else {
+			mouse_button_up(button);
+			mouse_send_state();
+			mouse_progress = frames;
+			phase = 3;
+		}
+	}
+	job->scratch[1] = (uint64_t)button | (uint64_t)phase << 8 | (uint64_t)press_only << 16;
+	return false;
+}
+
+static const mcp_tool tool_mouse_button = {
+	"mouse_button",
+	"Presses and/or releases a mouse button (left, right, middle). action \"tap\" (default) presses then releases "
+	"after hold_frames video frames (default 2 while running so a program that polls once per frame sees it; 0 while "
+	"paused, where the press and release are just queued); \"down\" and \"up\" hold and release a button, for "
+	"dragging. Position the pointer first with mouse_move. The program must have enabled the mouse.",
+	"{\"type\":\"object\",\"properties\":{"
+		"\"button\":{\"type\":\"string\",\"enum\":[\"left\",\"right\",\"middle\"],\"default\":\"left\"},"
+		"\"action\":{\"type\":\"string\",\"enum\":[\"tap\",\"down\",\"up\"],\"default\":\"tap\"},"
+		"\"hold_frames\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":100000},"
+		"\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600000}},\"additionalProperties\":false}",
+	run_mouse_button,
+	0,
+	cancel_mouse_button
+};
+
+static bool
+run_mouse_wheel(mcp_job *job)
+{
+	if (job->polls == 0) {
+		int32_t n;
+		if (!arg_int(job, "notches", -1000, 1000, &n) || n == 0) {
+			mcp_job_fail(job, "notches is required: a non-zero integer from -1000 to 1000 (positive = up, away from the user)");
+			return true;
+		}
+		uint8_t id = mouse_get_device_id();
+		if (id != 3 && id != 4) {
+			mcp_job_fail(job, "the mouse has no wheel: the program or KERNAL has not enabled wheel mode (PS/2 IntelliMouse)");
+			return true;
+		}
+		job->scratch[0] = pk(n, 0);
+		mouse_progress = frames;
+	}
+	int32_t n = pk_lo(job->scratch[0]);
+	while (n != 0) {
+		if (!mouse_has_room()) {
+			if (mcp_is_paused()) {
+				mcp_job_fail(job, "the mouse buffer is full and the emulator is paused; continue and repeat");
+				return true;
+			}
+			if (mouse_stalled()) {
+				mcp_job_fail(job, mouse_stall_msg);
+				return true;
+			}
+			job->scratch[0] = pk(n, 0);
+			return false;
+		}
+		mouse_progress = frames;
+		int32_t c = n > 7 ? 7 : n < -7 ? -7 : n; // one packet carries -8..7
+		mouse_set_wheel((int8_t)c);
+		mouse_send_state();
+		n -= c;
+	}
+	if (!mouse_drained()) {
+		job->scratch[0] = 0;
+		return false;
+	}
+	json_buf_append(&job->text, i2c_mse_buffer_count() ? "{\"scrolled\":true,\"consumed\":false}" : "{\"scrolled\":true,\"consumed\":true}");
+	return true;
+}
+
+static const mcp_tool tool_mouse_wheel = {
+	"mouse_wheel",
+	"Scrolls the mouse wheel by `notches` (positive = up, away from the user). Only works if the program or KERNAL "
+	"has enabled wheel mode; otherwise it returns an error. Long scrolls are delivered as the program consumes them.",
+	"{\"type\":\"object\",\"properties\":{\"notches\":{\"type\":\"integer\",\"minimum\":-1000,\"maximum\":1000},"
+	"\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600000}},\"required\":[\"notches\"],\"additionalProperties\":false}",
+	run_mouse_wheel,
+	0,
+	NULL
+};
+
 // ---- debug_stall (only registered when X16EMU_MCP_TEST is set) ----
 // Takes `ms` milliseconds to complete while the emulator keeps running; used to
 // test that polled jobs do not block the emulator and that timeouts work.
@@ -1028,7 +1333,7 @@ static const mcp_tool tool_debug_stall = {
 const mcp_tool *const *
 mcp_tool_table(void)
 {
-	static const mcp_tool *table[24];
+	static const mcp_tool *table[28];
 	if (!table[0]) {
 		size_t n = 0;
 		table[n++] = &tool_get_registers;
@@ -1049,6 +1354,9 @@ mcp_tool_table(void)
 		table[n++] = &tool_set_registers;
 		table[n++] = &tool_send_key;
 		table[n++] = &tool_type_text;
+		table[n++] = &tool_mouse_move;
+		table[n++] = &tool_mouse_button;
+		table[n++] = &tool_mouse_wheel;
 		if (getenv("X16EMU_MCP_TEST")) {
 			table[n++] = &tool_debug_stall;
 		}

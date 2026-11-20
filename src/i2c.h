@@ -36,6 +36,7 @@ void mouse_button_up(int num);
 void mouse_move(int x, int y);
 uint8_t mouse_read(uint8_t reg);
 void mouse_send_state(void);
+bool mouse_has_room(void);
 void mouse_set_wheel(int8_t y);
 uint8_t mouse_get_device_id();
 void mouse_set_device_id(uint8_t d);
