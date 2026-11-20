@@ -225,7 +225,8 @@ Tips:
 ## Tools
 
 Addresses and values may be given as JSON integers or as strings such as
-`"0x9F20"` or `"$9F20"`. Results are JSON text, except `get_screen`, which
+`"0x9F20"` or `"$9F20"`; addresses may also be label names once symbols are
+loaded (see "Symbols"). Results are JSON text, except `get_screen`, which
 returns a PNG image (with `path` it writes the file instead and returns JSON text
 giving the path and the byte count).
 
@@ -233,7 +234,7 @@ giving the path and the byte count).
 
 | Tool | Arguments | What it does |
 |---|---|---|
-| `get_registers` | none | pc, a, x, y, sp, status, current RAM and ROM bank, paused flag, and `cycles`: the exact number of CPU clock cycles executed since start. Subtract two values to measure what a routine costs; it is an unsigned 64-bit count, so it does not wrap in practice. Tool calls take no emulated time, so `cycles` only moves while the emulator runs, and it keeps counting across `reset` and `set_warp`. |
+| `get_registers` | none | pc, a, x, y, sp, status, current RAM and ROM bank, paused flag, `symbol` for pc (when symbols are loaded), and `cycles`: the exact number of CPU clock cycles executed since start. Subtract two values to measure what a routine costs; it is an unsigned 64-bit count, so it does not wrap in practice. Tool calls take no emulated time, so `cycles` only moves while the emulator runs, and it keeps counting across `reset` and `set_warp`. |
 | `get_status` | none | `frames` completed; `cycles` (the exact count right now, same as in `get_registers`); `cpu_cycles_at_last_frame` (the count when the last frame completed, which only changes once per frame); clock in MHz; `warp`; `lag_ms`; `paused`; `state`; number of breakpoints; `host_paths` (`restricted`, `unrestricted` or `disabled`) and `host_root` (the folder host paths must stay inside) |
 | `read_memory` | `address`\*, `space`, `count`, `bank`, `path`, `overwrite` | Reads 1 to 131072 bytes (`count`, default 16; the same limit applies with `path`) without side effects (I/O is not triggered). `space` is `cpu` (default; `$A000-$BFFF` banked RAM, `$C000-$FFFF` banked ROM, using the current banks unless `bank` is given) or `vram` (the 128 KB VERA space, including palette at `0x1FA00` and sprite attributes at `0x1FC00`). Returns one lowercase hex string. With `path`, the raw bytes are written to that host file instead and only the byte count is returned, which keeps large buffers (a 38,400-byte frame buffer is about 77 KB as hex) out of the conversation. An existing file is replaced only with `overwrite: true`. The path must lie inside the host path root (see "Host files and permissions"). |
 | `hash_memory` | `address`\*, `count`\* (1 to 131072), `space`, `bank`, `algorithm` | CRC32 and/or SHA-256 (`algorithm`: `crc32`, `sha256` or `both`, the default) of a range, read like `read_memory`. Compare a buffer against a known value without transferring it. The CRC32 is the standard one (`zlib.crc32`). |
@@ -388,6 +389,37 @@ and the `start_command` to use if you did not pass `run`.
   path root (see "Host files and permissions"); relative paths are relative to
   that root.
 
+### Symbols
+
+Load the labels of the program under test and use names instead of addresses.
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `load_symbols` | `path`\*, `replace` | Loads a ca65/ld65 label file, as written by `ld65 -Ln file.sym`: VICE-format lines such as `al 000801 .main`. Other lines are skipped and counted. Labels are added to those already loaded unless `replace: true`; a file with no labels changes nothing. The path must lie inside the host path root. |
+| `lookup_symbol` | `name` or `address` | `name` (`main`, `main+4`) returns the address and bank; `address` returns the nearest label at or below it, as `name+0xN`, or `null`. |
+
+Once symbols are loaded:
+
+- **Anywhere an address goes**, a label name works: the `address` of
+  `read_memory`, `hash_memory`, `write_memory`, `set_breakpoint`,
+  `set_watchpoint` and `load_prg`, and the `pc` of `set_registers`. `name+N` and
+  `name-N` add or subtract an offset (decimal, `0x` or `$` hex). Labels are
+  case-sensitive. An unknown name is an error that says so.
+- **Banks:** a label whose value has bits above the low 16 carries a bank in the
+  upper byte (`al 0AC123 .x` is `$C123` in bank 10, as in the X16 ROM's label
+  files). It supplies the bank for breakpoints, watchpoints and memory tools
+  when you give none; an explicit `bank` wins. Labels below `$A000` ignore banks.
+- **Results name the code.** `get_registers` and every stop result include
+  `symbol` for `pc`, for example `"symbol": "draw_line+0x1A"`, and watchpoint
+  stops add `accessing_pc_symbol`. `set_breakpoint` and `list_breakpoints` show
+  the label for each address. The label is the nearest one at or below the
+  address, within 4096 bytes and in the same region: from `$A000` up only labels
+  for the current RAM or ROM bank (or without a bank) are used. Linker symbols
+  whose names start and end with `__` (such as `__BSS_SIZE__`) are never offered
+  when naming an address, since they are sizes and limits, not code.
+- Only the **ca65/ld65 label format** is read. Debug-info (`.dbg`) and map files
+  are not.
+
 ### Mouse
 
 | Tool | Arguments | What it does |
@@ -493,6 +525,7 @@ has the helpers (`Emu`, `check`, `wait_screen`, ...).
 | `src/mcp_json.c` | The JSON parser and writer |
 | `src/mcp_hash.c` | SHA-256 for `hash_memory` (CRC32 comes from zlib) |
 | `src/mcp_paths.c` | The host path policy: root, restriction, `..` handling |
+| `src/mcp_symbols.c` | Label files, name lookup and naming addresses |
 
 A thread reads and parses requests; each `tools/call` becomes a job that the
 **emulator thread** runs at the top of `emulator_loop`, so tools can touch

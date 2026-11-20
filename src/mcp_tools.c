@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 #include <SDL.h>
 #include "glue.h"
 #include "memory.h"
@@ -13,6 +14,7 @@
 #include "keyboard.h"
 #include "mcp_hash.h"
 #include "mcp_paths.h"
+#include "mcp_symbols.h"
 #include <zlib.h>
 #include "i2c.h"
 #include "cpu/fake6502.h"
@@ -72,6 +74,37 @@ arg_uint(const mcp_job *job, const char *name, uint32_t *out)
 	return false;
 }
 
+// Like arg_uint for an address, but a string that is not a number may be a symbol loaded with load_symbols:
+// "name", "name+4", "name-2". *sym_bank (optional) gets the symbol's bank, or -1. If a name is unknown the
+// job is failed with a message that says so (job->is_error), so callers only add their generic message when
+// it is not already set.
+static bool
+arg_addr(mcp_job *job, const char *name, uint32_t *out, int *sym_bank)
+{
+	if (sym_bank) {
+		*sym_bank = -1;
+	}
+	if (arg_uint(job, name, out)) {
+		return true;
+	}
+	const char *str = json_as_string(json_get(job->args, name));
+	if (!str || !(isalpha((unsigned char)str[0]) || str[0] == '_')) {
+		return false;
+	}
+	char err[400];
+	uint16_t a;
+	int b;
+	if (!mcp_sym_find(str, &a, &b, err, sizeof(err))) {
+		mcp_job_fail(job, err);
+		return false;
+	}
+	*out = a;
+	if (sym_bank) {
+		*sym_bank = b;
+	}
+	return true;
+}
+
 // ---- get_registers ----
 
 static bool
@@ -80,11 +113,13 @@ run_get_registers(mcp_job *job)
 	char tmp[320];
 	snprintf(tmp, sizeof(tmp),
 		"{\"pc\":\"0x%04X\",\"a\":\"0x%02X\",\"x\":\"0x%02X\",\"y\":\"0x%02X\","
-		"\"sp\":\"0x%04X\",\"status\":\"0x%02X\",\"ram_bank\":%u,\"rom_bank\":%u,\"paused\":%s,\"cycles\":%llu}",
+		"\"sp\":\"0x%04X\",\"status\":\"0x%02X\",\"ram_bank\":%u,\"rom_bank\":%u,\"paused\":%s,\"cycles\":%llu",
 		regs.pc, regs.a, regs.xl, regs.yl, regs.sp, regs.status,
 		memory_get_ram_bank(), memory_get_rom_bank(), mcp_is_paused() ? "true" : "false",
 		(unsigned long long)mcp_total_cycles());
 	json_buf_append(&job->text, tmp);
+	mcp_append_symbol(&job->text, "symbol", regs.pc);
+	json_buf_append(&job->text, "}");
 	return true;
 }
 
@@ -159,8 +194,11 @@ parse_mem_range(mcp_job *job, mem_range *r, uint32_t count_default)
 	r->vram = !strcmp(space, "vram");
 	r->bank = 0;
 	r->count = count_default;
-	if (!arg_uint(job, "address", &r->address)) {
-		mcp_job_fail(job, "address is required: a non-negative integer or a string like \"0x9F20\" or \"$9F20\"");
+	int sym_bank;
+	if (!arg_addr(job, "address", &r->address, &sym_bank)) {
+		if (!job->is_error) {
+			mcp_job_fail(job, "address is required: a non-negative integer, a string like \"0x9F20\" or \"$9F20\", or a symbol loaded with load_symbols");
+		}
 		return false;
 	}
 	if (json_get(job->args, "count") ? !arg_uint(job, "count", &r->count) : count_default == 0) {
@@ -168,7 +206,11 @@ parse_mem_range(mcp_job *job, mem_range *r, uint32_t count_default)
 		return false;
 	}
 	r->have_bank = json_get(job->args, "bank") != NULL;
-	if (r->have_bank && (!arg_uint(job, "bank", &r->bank) || r->bank > 255)) {
+	if (!r->have_bank && !r->vram && sym_bank >= 0 && r->address >= 0xA000) { // a bank-qualified symbol brings its bank
+		r->have_bank = true;
+		r->bank = (uint32_t)sym_bank;
+	}
+	if (r->have_bank && json_get(job->args, "bank") && (!arg_uint(job, "bank", &r->bank) || r->bank > 255)) {
 		mcp_job_fail(job, "bank must be an integer from 0 to 255");
 		return false;
 	}
@@ -580,11 +622,17 @@ static bool
 run_set_breakpoint(mcp_job *job)
 {
 	uint32_t address, bank = 0;
-	if (!arg_uint(job, "address", &address) || address > 0xFFFF) {
-		mcp_job_fail(job, "address is required: 0 to 0xFFFF as an integer or a string like \"0xC000\" or \"$C000\"");
+	int sym_bank;
+	if (!arg_addr(job, "address", &address, &sym_bank) || address > 0xFFFF) {
+		if (!job->is_error) {
+			mcp_job_fail(job, "address is required: 0 to 0xFFFF as an integer, a string like \"0xC000\" or \"$C000\", or a symbol loaded with load_symbols");
+		}
 		return true;
 	}
 	int b = -1;
+	if (!json_get(job->args, "bank") && sym_bank >= 0 && address >= 0xA000) {
+		b = sym_bank; // a bank-qualified symbol brings its bank
+	}
 	if (json_get(job->args, "bank")) {
 		if (!arg_uint(job, "bank", &bank) || bank > 255) {
 			mcp_job_fail(job, "bank must be an integer from 0 to 255");
@@ -607,9 +655,11 @@ run_set_breakpoint(mcp_job *job)
 		snprintf(bankstr, sizeof(bankstr), "%d", b);
 	}
 	char tmp[160];
-	snprintf(tmp, sizeof(tmp), "{\"id\":%d,\"address\":\"0x%04X\",\"bank\":%s,\"already_set\":%s}",
+	snprintf(tmp, sizeof(tmp), "{\"id\":%d,\"address\":\"0x%04X\",\"bank\":%s,\"already_set\":%s",
 	         id, address, bankstr, existed ? "true" : "false");
 	json_buf_append(&job->text, tmp);
+	mcp_append_symbol(&job->text, "symbol", (uint16_t)address);
+	json_buf_append(&job->text, "}");
 	return true;
 }
 
@@ -677,13 +727,15 @@ run_list_breakpoints(mcp_job *job)
 	while (mcp_bp_get(i, &id, &address, &bank, &hits)) {
 		char tmp[128];
 		if (bank < 0) {
-			snprintf(tmp, sizeof(tmp), "%s{\"id\":%d,\"address\":\"0x%04X\",\"bank\":null,\"hits\":%u}",
+			snprintf(tmp, sizeof(tmp), "%s{\"id\":%d,\"address\":\"0x%04X\",\"bank\":null,\"hits\":%u",
 			         i ? "," : "", id, address, hits);
 		} else {
-			snprintf(tmp, sizeof(tmp), "%s{\"id\":%d,\"address\":\"0x%04X\",\"bank\":%d,\"hits\":%u}",
+			snprintf(tmp, sizeof(tmp), "%s{\"id\":%d,\"address\":\"0x%04X\",\"bank\":%d,\"hits\":%u",
 			         i ? "," : "", id, address, bank, hits);
 		}
 		json_buf_append(&job->text, tmp);
+		mcp_append_symbol(&job->text, "symbol", address);
+		json_buf_append(&job->text, "}");
 		i++;
 	}
 	json_buf_append(&job->text, "]");
@@ -757,9 +809,10 @@ run_set_watchpoint(mcp_job *job)
 	bool vram = !strcmp(space, "vram");
 	uint32_t limit = vram ? 0x20000u : 0x10000u;
 	uint32_t address, length = 1, bank = 0;
-	if (!arg_uint(job, "address", &address) || address >= limit) {
-		mcp_job_fail(job, vram ? "address is required: 0 to 0x1FFFF as an integer or a string like \"0x0A000\""
-		                       : "address is required: 0 to 0xFFFF as an integer or a string like \"0x9F23\" or \"$9F23\"");
+	int sym_bank;
+	if (!arg_addr(job, "address", &address, &sym_bank) || address >= limit) {
+		if (!job->is_error) mcp_job_fail(job, vram ? "address is required: 0 to 0x1FFFF as an integer or a string like \"0x0A000\""
+		                       : "address is required: 0 to 0xFFFF as an integer, a string like \"0x9F23\" or \"$9F23\", or a symbol loaded with load_symbols");
 		return true;
 	}
 	if (json_get(job->args, "length") && (!arg_uint(job, "length", &length) || length < 1 || length > limit
@@ -781,6 +834,9 @@ run_set_watchpoint(mcp_job *job)
 		}
 	}
 	int b = -1;
+	if (!vram && !json_get(job->args, "bank") && sym_bank >= 0 && address >= 0xA000) {
+		b = sym_bank; // a bank-qualified symbol brings its bank
+	}
 	if (json_get(job->args, "bank")) {
 		if (vram) {
 			mcp_job_fail(job, "bank only applies to space \"cpu\"");
@@ -969,8 +1025,11 @@ run_write_memory(mcp_job *job)
 	}
 	bool vram = !strcmp(space, "vram");
 	uint32_t address, bank = 0;
-	if (!arg_uint(job, "address", &address)) {
-		mcp_job_fail(job, "address is required: a non-negative integer or a string like \"0x0400\" or \"$0400\"");
+	int sym_bank;
+	if (!arg_addr(job, "address", &address, &sym_bank)) {
+		if (!job->is_error) {
+			mcp_job_fail(job, "address is required: a non-negative integer, a string like \"0x0400\" or \"$0400\", or a symbol loaded with load_symbols");
+		}
 		return true;
 	}
 	const char *hex = json_as_string(json_get(job->args, "hex"));
@@ -979,7 +1038,10 @@ run_write_memory(mcp_job *job)
 		return true;
 	}
 	bool have_bank = json_get(job->args, "bank") != NULL;
-	if (have_bank && (!arg_uint(job, "bank", &bank) || bank >= num_ram_banks)) {
+	if (!have_bank && !vram && sym_bank >= 0 && sym_bank < num_ram_banks && address >= 0xA000) { // a symbol's bank
+		have_bank = true;
+		bank = (uint32_t)sym_bank;
+	} else if (have_bank && (!arg_uint(job, "bank", &bank) || bank >= num_ram_banks)) {
 		mcp_job_fail(job, "bank must be a valid RAM bank number");
 		return true;
 	}
@@ -1079,7 +1141,11 @@ run_set_registers(mcp_job *job)
 		if (!json_get(job->args, fields[i].name)) {
 			continue;
 		}
-		if (!arg_uint(job, fields[i].name, &v[i]) || v[i] > fields[i].max) {
+		bool got = !strcmp(fields[i].name, "pc") ? arg_addr(job, "pc", &v[i], NULL) : arg_uint(job, fields[i].name, &v[i]);
+		if (job->is_error) {
+			return true; // an unknown symbol, already reported
+		}
+		if (!got || v[i] > fields[i].max) {
 			char msg[96];
 			snprintf(msg, sizeof(msg), "%s must be an integer from 0 to 0x%X", fields[i].name, fields[i].max);
 			mcp_job_fail(job, msg);
@@ -1346,6 +1412,114 @@ static const mcp_tool tool_get_vera_state = {
 	0
 };
 
+// ---- load_symbols / lookup_symbol ----
+
+static bool
+run_load_symbols(mcp_job *job)
+{
+	const json_node *pn = json_get(job->args, "path");
+	const char *path = json_as_string(pn);
+	if (!path || !path[0] || pn->string_len != strlen(path)) {
+		mcp_job_fail(job, "path is required: a ca65/ld65 label file (ld65 -Ln), lines like \"al 000801 .main\"");
+		return true;
+	}
+	const json_node *rn = json_get(job->args, "replace");
+	if (rn && rn->type != JSON_BOOL) {
+		mcp_job_fail(job, "replace must be true or false");
+		return true;
+	}
+	char resolved[4200];
+	if (!host_path(job, path, resolved, sizeof(resolved))) {
+		return true;
+	}
+	size_t added, skipped;
+	char err[700];
+	if (!mcp_sym_load(resolved, rn && rn->boolean, &added, &skipped, err, sizeof(err))) {
+		mcp_job_fail(job, err);
+		return true;
+	}
+	char tmp[200];
+	snprintf(tmp, sizeof(tmp), "{\"loaded\":%zu,\"skipped_lines\":%zu,\"total\":%zu,\"replaced\":%s}", added, skipped,
+	         mcp_sym_count(), rn && rn->boolean ? "true" : "false");
+	json_buf_append(&job->text, tmp);
+	return true;
+}
+
+static const mcp_tool tool_load_symbols = {
+	"load_symbols",
+	"Loads labels from a ca65/ld65 label file (written by ld65 -Ln, VICE format: lines like \"al 000801 .main\"; "
+	"an address with more than four hex digits carries the bank in the upper byte, as in the X16 ROM's labels). "
+	"Afterwards any `address` (or `pc` for set_registers) may be a label name, or \"name+4\" / \"name-2\" (offset in "
+	"decimal or 0x/$ hex), in read_memory, hash_memory, write_memory, set_breakpoint, set_watchpoint, load_prg and "
+	"set_registers; a label with a bank supplies it when you give none. Stops and get_registers then report the "
+	"label too, as \"symbol\": \"name+0x12\" (the nearest label at or below, within 4096 bytes; for addresses from "
+	"$A000 up only labels for the current bank; linker symbols like __X_SIZE__ are skipped). Labels are "
+	"case-sensitive. Symbols are added to those already loaded unless replace is true. The path must lie inside "
+	"the host path root, as for load_prg.",
+	"{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"replace\":{\"type\":\"boolean\",\"default\":false}},"
+	"\"required\":[\"path\"],\"additionalProperties\":false}",
+	run_load_symbols,
+	0
+};
+
+static bool
+run_lookup_symbol(mcp_job *job)
+{
+	const json_node *nn = json_get(job->args, "name");
+	const json_node *an = json_get(job->args, "address");
+	if ((nn != NULL) == (an != NULL)) {
+		mcp_job_fail(job, "pass either name (to find its address) or address (to find the label)");
+		return true;
+	}
+	char tmp[400];
+	if (nn) {
+		const char *name = json_as_string(nn);
+		uint16_t a;
+		int b;
+		char err[400];
+		if (!name || !mcp_sym_find(name, &a, &b, err, sizeof(err))) {
+			mcp_job_fail(job, name ? err : "name must be a string");
+			return true;
+		}
+		snprintf(tmp, sizeof(tmp), "{\"address\":\"0x%04X\",\"bank\":", a);
+		json_buf_append(&job->text, tmp);
+		if (b >= 0) {
+			snprintf(tmp, sizeof(tmp), "%d}", b);
+			json_buf_append(&job->text, tmp);
+		} else {
+			json_buf_append(&job->text, "null}");
+		}
+		return true;
+	}
+	uint32_t a;
+	if (!arg_addr(job, "address", &a, NULL) || a > 0xFFFF) {
+		if (!job->is_error) mcp_job_fail(job, "address must be 0 to 0xFFFF");
+		return true;
+	}
+	snprintf(tmp, sizeof(tmp), "{\"address\":\"0x%04X\",\"symbols_loaded\":%zu", a, mcp_sym_count());
+	json_buf_append(&job->text, tmp);
+	char sym[320];
+	if (mcp_sym_describe((uint16_t)a, sym, sizeof(sym))) {
+		json_buf_append(&job->text, ",\"symbol\":");
+		json_buf_append_string(&job->text, sym, strlen(sym));
+	} else {
+		json_buf_append(&job->text, ",\"symbol\":null");
+	}
+	json_buf_append(&job->text, "}");
+	return true;
+}
+
+static const mcp_tool tool_lookup_symbol = {
+	"lookup_symbol",
+	"Looks a label up. With `name` (\"main\", \"main+4\") it returns the address and bank; with `address` it returns "
+	"the nearest label at or below it as \"name+0xN\" (null if none within 4096 bytes in the right region or bank). "
+	"Needs symbols loaded with load_symbols.",
+	"{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"address\":{\"type\":[\"integer\",\"string\"]}},"
+	"\"additionalProperties\":false}",
+	run_lookup_symbol,
+	0
+};
+
 // ---- reset / set_warp ----
 
 extern char *clipboard_buffer; // main.c: text queued for typing, owned by the paste machinery
@@ -1447,8 +1621,10 @@ run_load_prg(mcp_job *job)
 	uint32_t override = 0, bank = 0;
 	bool have_addr = json_get(job->args, "address") != NULL;
 	bool have_bank = json_get(job->args, "bank") != NULL;
-	if (have_addr && (!arg_uint(job, "address", &override) || override > 0xFFFF)) {
-		mcp_job_fail(job, "address must be 0 to 0xFFFF as an integer or a string like \"0x0801\"");
+	if (have_addr && (!arg_addr(job, "address", &override, NULL) || override > 0xFFFF)) {
+		if (!job->is_error) {
+			mcp_job_fail(job, "address must be 0 to 0xFFFF as an integer, a string like \"0x0801\", or a symbol loaded with load_symbols");
+		}
 		return true;
 	}
 	if (raw && !have_addr) {
@@ -1991,7 +2167,7 @@ static const mcp_tool tool_debug_stall = {
 const mcp_tool *const *
 mcp_tool_table(void)
 {
-	static const mcp_tool *table[44];
+	static const mcp_tool *table[48];
 	if (!table[0]) {
 		size_t n = 0;
 		table[n++] = &tool_get_registers;
@@ -2017,6 +2193,8 @@ mcp_tool_table(void)
 		table[n++] = &tool_send_key;
 		table[n++] = &tool_type_text;
 		table[n++] = &tool_load_prg;
+		table[n++] = &tool_load_symbols;
+		table[n++] = &tool_lookup_symbol;
 		table[n++] = &tool_mouse_move;
 		table[n++] = &tool_mouse_button;
 		table[n++] = &tool_mouse_wheel;

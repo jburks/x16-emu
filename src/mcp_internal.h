@@ -124,6 +124,10 @@ void mcp_describe_stop(json_buf *out);
 // Exact number of CPU clock cycles executed since start (not just as of the last frame).
 uint64_t mcp_total_cycles(void);
 
+// Appends ,"key":"name+0xN" (the nearest label at or below address) to a JSON object being built, if symbols
+// are loaded and one is close enough. Does nothing otherwise.
+void mcp_append_symbol(json_buf *b, const char *key, uint16_t address);
+
 // Helpers for tool implementations
 void mcp_job_fail(mcp_job *job, const char *message);  // sets is_error and the text
 

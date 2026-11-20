@@ -26,7 +26,7 @@ def check(name, cond, got=None):
 
 call("initialize", {"protocolVersion":"2025-11-25"})
 names = [t["name"] for t in call("tools/list")["result"]["tools"]]
-check("tools/list", names == ["get_registers","get_status","read_memory","hash_memory","get_screen","get_vera_state","pause","continue","run_frames","set_breakpoint","clear_breakpoint","list_breakpoints","step","set_watchpoint","clear_watchpoint","list_watchpoints","write_memory","set_registers","reset","set_warp","send_key","type_text","load_prg","mouse_move","mouse_button","mouse_wheel"], names)
+check("tools/list", names == ["get_registers","get_status","read_memory","hash_memory","get_screen","get_vera_state","pause","continue","run_frames","set_breakpoint","clear_breakpoint","list_breakpoints","step","set_watchpoint","clear_watchpoint","list_watchpoints","write_memory","set_registers","reset","set_warp","send_key","type_text","load_prg","load_symbols","lookup_symbol","mouse_move","mouse_button","mouse_wheel"], names)
 time.sleep(1.5)
 
 # ---- read_memory ----

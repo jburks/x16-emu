@@ -10,6 +10,7 @@
 #include "cpu/fake6502.h"
 #include "mcp.h"
 #include "mcp_internal.h"
+#include "mcp_symbols.h"
 
 mcp_stop_info mcp_last_stop = { STOP_NONE, 0 };
 int mcp_bp_active = 0;
@@ -347,6 +348,18 @@ mcp_debug_check(void)
 	}
 }
 
+void
+mcp_append_symbol(json_buf *b, const char *key, uint16_t address)
+{
+	char sym[320];
+	if (mcp_sym_describe(address, sym, sizeof(sym))) {
+		json_buf_append(b, ",\"");
+		json_buf_append(b, key);
+		json_buf_append(b, "\":");
+		json_buf_append_string(b, sym, strlen(sym));
+	}
+}
+
 const char *
 mcp_stop_name(void)
 {
@@ -390,6 +403,8 @@ mcp_describe_stop(json_buf *out)
 			         watch_hit.address, watch_hit.value, watch_hit.pc);
 		}
 		json_buf_append(out, tmp);
+		mcp_append_symbol(out, "accessing_pc_symbol", watch_hit.pc);
 	}
+	mcp_append_symbol(out, "symbol", regs.pc);
 	json_buf_append(out, "}");
 }
