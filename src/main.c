@@ -41,6 +41,7 @@
 #include "version.h"
 #include "wav_recorder.h"
 #include "testbench.h"
+#include "mcp.h"
 #include "cartridge.h"
 #include "midi.h"
 #include "git_rev.h"
@@ -514,6 +515,11 @@ usage()
 	printf("\tSet the real-time-clock to the current system time and date.\n");
 	printf("-via2\n");
 	printf("\tInstall the second VIA chip expansion at $9F10\n");
+	printf("-mcp\n");
+	printf("\tRun as an MCP (Model Context Protocol) server over stdin/stdout.\n");
+	printf("\tstdout carries only protocol messages; all other output goes to\n");
+	printf("\tstderr. Set X16EMU_MCP_LOG=1 to log the traffic on stderr.\n");
+	printf("\tNot compatible with -testbench.\n");
 	printf("-testbench\n");
 	printf("\tHeadless mode for unit testing with an external test runner\n");
 	printf("-mhz <integer>\n");
@@ -1098,7 +1104,19 @@ main(int argc, char **argv)
 			argc--;
 			argv++;
 			exit(0);
+		} else if (!strcmp(argv[0], "-mcp")) {
+			argc--;
+			argv++;
+			if (testbench) {
+				fprintf(stderr, "-mcp and -testbench cannot be combined\n");
+				exit(1);
+			}
+			mcp_enable();
 		} else if (!strcmp(argv[0], "-testbench")){
+			if (mcp_enabled) {
+				fprintf(stderr, "-mcp and -testbench cannot be combined\n");
+				exit(1);
+			}
 			printf("Testbench mode...\n");
 			fflush(stdout);
 			argc--;
@@ -1290,6 +1308,9 @@ main(int argc, char **argv)
 	emscripten_cancel_main_loop();
 	emscripten_set_main_loop(emscripten_main_loop, 0, 1);
 #else
+	if (mcp_enabled) {
+		mcp_start();
+	}
 	emulator_loop(NULL);
 #endif
 
@@ -1585,6 +1606,8 @@ emulator_loop(void *param)
 {
 	uint32_t old_clockticks6502 = clockticks6502;
 	for (;;) {
+		if (mcp_enabled) mcp_service();
+
 		if (smc_requested_reset) machine_reset();
 
 		if (testbench && regs.pc == 0xfffd){
