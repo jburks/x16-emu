@@ -15,6 +15,7 @@
 #include "mcp_hash.h"
 #include "mcp_paths.h"
 #include "mcp_symbols.h"
+#include "disasm.h"
 #include <zlib.h>
 #include "i2c.h"
 #include "cpu/fake6502.h"
@@ -1338,6 +1339,154 @@ static const mcp_tool tool_type_text = {
 	NULL
 };
 
+// ---- disassemble ----
+
+// A relative branch (BPL BMI BVC BVS BRA BCC BCS BNE BEQ): the same opcodes on the 65C02 and the 65C816.
+static bool
+is_relative_branch(uint8_t op)
+{
+	return op == 0x10 || op == 0x30 || op == 0x50 || op == 0x70 || op == 0x80 || op == 0x90 || op == 0xB0 ||
+	       op == 0xD0 || op == 0xF0;
+}
+
+static bool
+run_disassemble(mcp_job *job)
+{
+	uint32_t address, count = 16, bank = 0;
+	int sym_bank;
+	if (!arg_addr(job, "address", &address, &sym_bank) || address > 0xFFFF) {
+		if (!job->is_error) {
+			mcp_job_fail(job, "address is required: 0 to 0xFFFF as an integer, a string like \"0xC000\" or \"$C000\", or a symbol loaded with load_symbols");
+		}
+		return true;
+	}
+	if (json_get(job->args, "count") && (!arg_uint(job, "count", &count) || count < 1 || count > 256)) {
+		mcp_job_fail(job, "count must be an integer from 1 to 256 (instructions)");
+		return true;
+	}
+	bool have_bank = json_get(job->args, "bank") != NULL;
+	if (have_bank && (!arg_uint(job, "bank", &bank) || bank > 255)) {
+		mcp_job_fail(job, "bank must be an integer from 0 to 255");
+		return true;
+	}
+	if (!have_bank && sym_bank >= 0 && address >= 0xA000) { // a bank-qualified symbol brings its bank
+		have_bank = true;
+		bank = (uint32_t)sym_bank;
+	}
+	int16_t x16bank = have_bank ? (int16_t)bank : USE_CURRENT_X16_BANK;
+	uint8_t prog_bank = regs.is65c816 ? regs.k : 0;
+
+	json_buf *t = &job->text;
+	char tmp[400];
+	snprintf(tmp, sizeof(tmp), "{\"address\":\"0x%04X\",\"cpu\":\"%s\",\"ram_bank\":%u,\"rom_bank\":%u,\"instructions\":[",
+	         address, regs.is65c816 ? "65c816" : "65c02", have_bank ? bank : memory_get_ram_bank(),
+	         have_bank ? bank : memory_get_rom_bank());
+	json_buf_append(t, tmp);
+
+	uint32_t pc = address;
+	uint32_t done = 0;
+	const char *stopped = NULL;
+	for (; done < count; done++) {
+		char line[96];
+		int32_t eff;
+		int len = disasm((uint16_t)pc, prog_bank, RAM, line, sizeof(line), x16bank, regs.status, &eff);
+		if (len < 1) {
+			stopped = "the instruction could not be decoded";
+			break;
+		}
+		if (pc + (uint32_t)len > 0x10000) {
+			stopped = "the next instruction runs past the end of the address space";
+			break;
+		}
+		uint8_t b[4] = { 0 };
+		for (int k = 0; k < len && k < 4; k++) {
+			b[k] = (uint8_t)debug_read6502((uint16_t)(pc + (uint32_t)k), prog_bank, x16bank);
+		}
+		// text: lower case from the core, shown upper case; trailing blanks removed
+		size_t n = strlen(line);
+		while (n > 0 && line[n - 1] == ' ') line[--n] = 0;
+		for (size_t k = 0; k < n; k++) line[k] = (char)toupper((unsigned char)line[k]);
+		int target = -1;
+		if (is_relative_branch(b[0])) {
+			target = (int)((pc + 2 + (uint32_t)(int32_t)(int8_t)b[1]) & 0xFFFF);
+			char *sp = strchr(line, ' ');
+			if (sp) { // the core prints the target without padding ("BNE $610"): make it four digits
+				snprintf(sp, sizeof(line) - (size_t)(sp - line), " $%04X", target);
+			}
+		} else if (!regs.is65c816 && (b[0] & 0x0F) == 0x0F) { // BBRn / BBSn zp,rel
+			target = (int)((pc + 3 + (uint32_t)(int32_t)(int8_t)b[2]) & 0xFFFF);
+		} else if (b[0] == 0x4C || b[0] == 0x20) { // JMP abs, JSR abs
+			target = b[1] | b[2] << 8;
+		}
+
+		snprintf(tmp, sizeof(tmp), "%s{\"address\":\"0x%04X\",\"bytes\":\"", done ? "," : "", pc);
+		json_buf_append(t, tmp);
+		for (int k = 0; k < len && k < 4; k++) {
+			snprintf(tmp, sizeof(tmp), "%02X", b[k]);
+			json_buf_append(t, tmp);
+		}
+		json_buf_append(t, "\",\"text\":");
+		json_buf_append_string(t, line, strlen(line));
+		snprintf(tmp, sizeof(tmp), ",\"length\":%d", len);
+		json_buf_append(t, tmp);
+		char sym[320];
+		if (mcp_sym_describe((uint16_t)pc, sym, sizeof(sym)) && !strchr(sym, '+')) { // a label exactly here
+			json_buf_append(t, ",\"label\":");
+			json_buf_append_string(t, sym, strlen(sym));
+		}
+		if (target >= 0) {
+			snprintf(tmp, sizeof(tmp), ",\"target\":\"0x%04X\"", target);
+			json_buf_append(t, tmp);
+			if (mcp_sym_describe((uint16_t)target, sym, sizeof(sym))) {
+				json_buf_append(t, ",\"target_symbol\":");
+				json_buf_append_string(t, sym, strlen(sym));
+			}
+		}
+		if (pc == regs.pc) { // the registers describe this instruction only
+			json_buf_append(t, ",\"current\":true");
+			if (eff >= 0) {
+				snprintf(tmp, sizeof(tmp), ",\"effective_address\":\"0x%04X\"", eff & 0xFFFF);
+				json_buf_append(t, tmp);
+			}
+		}
+		json_buf_append(t, "}");
+		pc += (uint32_t)len;
+	}
+	json_buf_append(t, "]");
+	if (pc <= 0xFFFF) {
+		snprintf(tmp, sizeof(tmp), ",\"next\":\"0x%04X\"", pc);
+		json_buf_append(t, tmp);
+	}
+	if (stopped) {
+		json_buf_append(t, ",\"stopped\":");
+		json_buf_append_string(t, stopped, strlen(stopped));
+	}
+	json_buf_append(t, "}");
+	return true;
+}
+
+static const mcp_tool tool_disassemble = {
+	"disassemble",
+	"Disassembles `count` instructions (default 16, at most 256) starting at `address`, which may be a label from "
+	"load_symbols. Uses the emulator's own disassembler (65C02, or 65C816 if the emulator runs in that mode) and "
+	"reads memory without side effects, so it is safe on I/O and ROM. Banks: the current RAM and ROM banks unless "
+	"`bank` is given (it selects both, as for read_memory). Each instruction has its address, bytes, text "
+	"(e.g. \"LDA #$05\"; branch targets are shown as full addresses), length, and where they apply `label` (a label "
+	"exactly at this address), `target` and `target_symbol` (for relative branches, BBRn/BBSn, JMP and JSR with an "
+	"absolute operand), and for the instruction at pc only `current` and `effective_address` (the memory address "
+	"it will use, computed from the current registers). `next` is the address after the last instruction, to "
+	"continue from. A disassembler decodes from the address you give it, so start at a real instruction boundary "
+	"(a label, an entry point, or a pc); data decodes as meaningless instructions. Pause first when disassembling "
+	"code that may be changing.",
+	"{\"type\":\"object\",\"properties\":{"
+		"\"address\":{\"type\":[\"integer\",\"string\"],\"description\":\"integer, string like \\\"$C000\\\", or a label\"},"
+		"\"count\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":256,\"default\":16},"
+		"\"bank\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255}},"
+	 "\"required\":[\"address\"],\"additionalProperties\":false}",
+	run_disassemble,
+	0
+};
+
 // ---- get_vera_state ----
 
 static void
@@ -2244,7 +2393,7 @@ static const mcp_tool tool_debug_stall = {
 const mcp_tool *const *
 mcp_tool_table(void)
 {
-	static const mcp_tool *table[52];
+	static const mcp_tool *table[56];
 	if (!table[0]) {
 		size_t n = 0;
 		table[n++] = &tool_get_registers;
@@ -2253,6 +2402,7 @@ mcp_tool_table(void)
 		table[n++] = &tool_hash_memory;
 		table[n++] = &tool_get_screen;
 		table[n++] = &tool_get_vera_state;
+		table[n++] = &tool_disassemble;
 		table[n++] = &tool_pause;
 		table[n++] = &tool_continue;
 		table[n++] = &tool_run_frames;

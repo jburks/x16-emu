@@ -22,7 +22,7 @@ def check(name, cond, got=None):
 
 call("initialize", {"protocolVersion":"2025-11-25"})
 r = call("tools/list"); names = [t["name"] for t in r["result"]["tools"]]
-check("tools/list: get_registers + debug_stall", names == ["get_registers","get_status","read_memory","hash_memory","get_screen","get_vera_state","pause","continue","run_frames","set_breakpoint","clear_breakpoint","list_breakpoints","step","set_watchpoint","clear_watchpoint","list_watchpoints","write_memory","set_registers","reset","set_warp","send_key","type_text","load_prg","load_symbols","lookup_symbol","list_symbols","mouse_move","mouse_button","mouse_wheel","debug_stall"], names)
+check("tools/list: get_registers + debug_stall", names == ["get_registers","get_status","read_memory","hash_memory","get_screen","get_vera_state","disassemble","pause","continue","run_frames","set_breakpoint","clear_breakpoint","list_breakpoints","step","set_watchpoint","clear_watchpoint","list_watchpoints","write_memory","set_registers","reset","set_warp","send_key","type_text","load_prg","load_symbols","lookup_symbol","list_symbols","mouse_move","mouse_button","mouse_wheel","debug_stall"], names)
 check("tools have inputSchema", all("inputSchema" in t and "description" in t for t in r["result"]["tools"]))
 
 time.sleep(1.0)  # let the ROM boot a bit
