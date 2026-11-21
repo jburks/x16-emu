@@ -1442,6 +1442,22 @@ run_disassemble(mcp_job *job)
 				json_buf_append_string(t, sym, strlen(sym));
 			}
 		}
+		// The memory operand (zero page, absolute, indexed, indirect vector): its address, and the label for it. Not
+		// for immediates, relative branches or JMP/JSR abs (those have a target), nor in 65C816 mode, where the
+		// operands can be long or stack-relative.
+		if (!regs.is65c816 && !is_relative_branch(b[0]) && b[0] != 0x4C && b[0] != 0x20) {
+			const char *sp = strchr(line, ' ');
+			const char *dollar = sp && sp[1] != '#' ? strchr(sp, '$') : NULL;
+			if (dollar) {
+				unsigned long v = strtoul(dollar + 1, NULL, 16) & 0xFFFF;
+				snprintf(tmp, sizeof(tmp), ",\"operand_address\":\"0x%04lX\"", v);
+				json_buf_append(t, tmp);
+				if (mcp_sym_describe((uint16_t)v, sym, sizeof(sym))) {
+					json_buf_append(t, ",\"operand_symbol\":");
+					json_buf_append_string(t, sym, strlen(sym));
+				}
+			}
+		}
 		if (pc == regs.pc) { // the registers describe this instruction only
 			json_buf_append(t, ",\"current\":true");
 			if (eff >= 0) {
@@ -1473,7 +1489,9 @@ static const mcp_tool tool_disassemble = {
 	"`bank` is given (it selects both, as for read_memory). Each instruction has its address, bytes, text "
 	"(e.g. \"LDA #$05\"; branch targets are shown as full addresses), length, and where they apply `label` (a label "
 	"exactly at this address), `target` and `target_symbol` (for relative branches, BBRn/BBSn, JMP and JSR with an "
-	"absolute operand), and for the instruction at pc only `current` and `effective_address` (the memory address "
+	"absolute operand), `operand_address` and `operand_symbol` (the memory address a zero-page, absolute, indexed or "
+	"indirect operand names, and its label: the nearest label at or below it, so read the offset), and for the "
+	"instruction at pc only `current` and `effective_address` (the memory address "
 	"it will use, computed from the current registers). `next` is the address after the last instruction, to "
 	"continue from. A disassembler decodes from the address you give it, so start at a real instruction boundary "
 	"(a label, an entry point, or a pc); data decodes as meaningless instructions. Pause first when disassembling "

@@ -32,7 +32,7 @@ check("addresses advance by length", all(int(b["address"], 16) == int(a["address
 check("result header: start address, cpu, banks, next", r["address"] == "0x0600" and r["cpu"] == "65c02" and "ram_bank" in r and r["next"] == "0x%04X" % (0x600 + len(code) // 2), {k: v for k, v in r.items() if k != "instructions"})
 check("mnemonics and operands are upper case", all(i["text"] == i["text"].upper() for i in r["instructions"]))
 check("an instruction at no address has no label/target/current keys unless they apply",
-      all(set(i) <= {"address", "bytes", "text", "length", "target", "target_symbol", "label", "current", "effective_address"} for i in r["instructions"]))
+      all(set(i) <= {"address", "bytes", "text", "length", "target", "target_symbol", "label", "current", "effective_address", "operand_address", "operand_symbol"} for i in r["instructions"]))
 
 # ---- branch targets ----
 put(0x700, "D0FE 8003 EA EA EA F0 F0 0F1002 8F10FE 203412 4C0007 90 00")
@@ -58,6 +58,20 @@ check("branch and JSR targets carry their symbol", ins[0]["target_symbol"] == "s
 check("label as the address argument", r["address"] == "0x0700" and dis("start+2", 1)["instructions"][0]["address"] == "0x0702")
 check("a label with an offset is named name+0xN for targets", dis(0x700, 1)["instructions"][0]["target_symbol"] == "start")
 err, t = e.call("disassemble", {"address": "nosuch"}); check("an unknown label is an error", err and "unknown symbol" in t, t)
+
+# ---- operand addresses and their symbols ----
+open(os.path.join(tmp, "o.sym"), "w").write("al 000010 .counter\nal 000710 .table\nal 009F20 .vera_addr\n")
+e.ok("load_symbols", {"path": os.path.join(tmp, "o.sym"), "replace": True})
+put(0x900, "BD1007 A510 B110 6C1000 8D239F A905 0F1004 AD1207 4C0007 203412 D0FE 0A")
+r = dis(0x900, 12)
+op = [(i["text"], i.get("operand_address"), i.get("operand_symbol")) for i in r["instructions"]]
+want = [("LDA $0710,X", "0x0710", "table"), ("LDA $10", "0x0010", "counter"), ("LDA ($10),Y", "0x0010", "counter"), ("JMP ($0010)", "0x0010", "counter"),
+        ("STA $9F23", "0x9F23", "vera_addr+0x3"), ("LDA #$05", None, None), ("BBR0 $10, $0916", "0x0010", "counter"), ("LDA $0712", "0x0712", "table+0x2"),
+        ("JMP $0700", None, None), ("JSR $1234", None, None), ("BNE $0919", None, None), ("ASL A", None, None)]
+check("operand_address and operand_symbol: indexed, zero page, indirect, JMP vector, BBR, offsets (table+0x2)", [x[:3] for x in op][:8] == want[:8], op[:8])
+check("immediates, JMP/JSR abs (they have targets), branches and implied/accumulator have no operand fields", all(x[1] is None for x in op[8:]) and op[5][1] is None, op)
+put(0xA00, "AD0020"); check("an operand far from any label has an address and no symbol", (lambda i: i["operand_address"] == "0x2000" and "operand_symbol" not in i)(dis(0xA00, 1)["instructions"][0]), dis(0xA00, 1)["instructions"][0])
+check("control-flow instructions keep target/target_symbol and gain no operand fields", "target" in r["instructions"][8] and "operand_address" not in r["instructions"][8])
 
 # ---- the instruction at pc: current marker and effective address ----
 put(0x800, "BD1007 B110 AD0007 EA")      # LDA $0710,X / LDA ($10),Y / LDA $0700 / NOP

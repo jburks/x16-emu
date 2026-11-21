@@ -239,7 +239,7 @@ giving the path and the byte count).
 | `read_memory` | `address`\*, `space`, `count`, `bank`, `path`, `overwrite` | Reads 1 to 131072 bytes (`count`, default 16; the same limit applies with `path`) without side effects (I/O is not triggered). `space` is `cpu` (default; `$A000-$BFFF` banked RAM, `$C000-$FFFF` banked ROM, using the current banks unless `bank` is given) or `vram` (the 128 KB VERA space, including palette at `0x1FA00` and sprite attributes at `0x1FC00`). Returns one lowercase hex string. With `path`, the raw bytes are written to that host file instead and only the byte count is returned, which keeps large buffers (a 38,400-byte frame buffer is about 77 KB as hex) out of the conversation. An existing file is replaced only with `overwrite: true`. The path must lie inside the host path root (see "Host files and permissions"). |
 | `hash_memory` | `address`\*, `count`\* (1 to 131072), `space`, `bank`, `algorithm` | CRC32 and/or SHA-256 (`algorithm`: `crc32`, `sha256` or `both`, the default) of a range, read like `read_memory`. Compare a buffer against a known value without transferring it. The CRC32 is the standard one (`zlib.crc32`). |
 | `get_vera_state` | none | VERA's internal state, which the registers at `$9F20-$9F3F` do not show: both data ports at once (address, signed step, increment field, prefetched byte, nibble flags), `addrsel` and `dcsel`, the IRQ enable and status bits, the line-compare value and whether IRQ is asserted, the current raster line, and the FX state (mode, flags, the four cache bytes as hex, pixel increments and positions as decimals plus `_raw` hex, polygon length, affine bases, multiplier accumulator). Reading has no side effects. |
-| `disassemble` | `address`\*, `count`, `bank` | Disassembles `count` instructions (default 16, at most 256) from `address` (a number or a label), using the emulator's own disassembler (65C02, or 65C816 if the emulator runs in that mode). Reads without side effects, so it is safe on I/O and ROM. Each instruction has `address`, `bytes`, `text` (`LDA #$05`), `length`, and where they apply `label` (a label exactly at that address), `target` and `target_symbol` (relative branches, `BBRn`/`BBSn`, absolute `JMP` and `JSR`), and, for the instruction at `pc` only, `current` and `effective_address`. `next` is where to continue. |
+| `disassemble` | `address`\*, `count`, `bank` | Disassembles `count` instructions (default 16, at most 256) from `address` (a number or a label), using the emulator's own disassembler (65C02, or 65C816 if the emulator runs in that mode). Reads without side effects, so it is safe on I/O and ROM. Each instruction has `address`, `bytes`, `text` (`LDA #$05`), `length`, and where they apply `label` (a label exactly at that address), `target` and `target_symbol` (relative branches, `BBRn`/`BBSn`, absolute `JMP` and `JSR`), `operand_address` and `operand_symbol` (the address a zero-page, absolute, indexed or indirect operand names, and its label), and, for the instruction at `pc` only, `current` and `effective_address`. `next` is where to continue. |
 | `get_screen` | `path`, `overwrite` | 640x480 PNG of the current framebuffer. With `path` it is written to that host file instead of being returned, inside the host path root. |
 
 Example `get_vera_state` result, trimmed (a real run, paused at the BASIC prompt
@@ -278,6 +278,16 @@ Notes on `disassemble`:
 - Branch targets are shown as full four-digit addresses (`BNE $0612`), and
   every `target` is the address the branch, `JMP` or `JSR` goes to. `JMP (abs)`
   and `JMP (abs,X)` have no static target.
+- `text` always shows numbers; names are in the separate fields. `target_symbol`
+  names where control goes, `operand_symbol` names the data an instruction
+  reads or writes (`LDA $0710,X` gives `operand_address` `0x0710` and, with a
+  label there, `operand_symbol` `table`), and `label` names the instruction's own
+  address. Immediates (`LDA #$10`) have no operand address. In 65C816 mode
+  `operand_*` is not reported.
+- A symbol is the nearest label at or below the address (within 4096 bytes), so
+  an address inside a table is `table+0x2`, and an unrelated number that happens
+  to fall just above a label gets that label with an offset: read the offset
+  before trusting the name.
 - `effective_address` is the memory address the instruction at `pc` will use
   (for example `$0710 + X` for `LDA $0710,X`), worked out from the registers as
   they are now, so it is given for that one instruction only.
