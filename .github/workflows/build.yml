@@ -218,7 +218,8 @@ jobs:
           cmake --build .
       - name: Check that the MCP server is left out
         run: |
-          if nm build/x16emu | grep -q ' mcp_'; then echo "mcp symbols found in a build without MCP"; exit 1; fi
+          # Global symbols only: unoptimized builds keep local copies (nm type t) of the inline stubs in src/mcp.h.
+          if nm build/x16emu | grep -E ' [TDBR] mcp_'; then echo "MCP server symbols found in a build without MCP"; exit 1; fi
           set +e
           build/x16emu -mcp -nowindow > out.txt 2>&1 < /dev/null
           status=$?
