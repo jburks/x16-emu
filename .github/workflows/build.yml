@@ -68,7 +68,7 @@ jobs:
           git diff
           mkdir build
           cd build
-          cmake .. -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
           cmake --build .
       - name: Package Emulator
         run: |
@@ -156,7 +156,7 @@ jobs:
           git diff
           mkdir build
           cd build
-          cmake .. -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
           cmake --build .
       - name: Package Emulator
         run: |
@@ -214,7 +214,7 @@ jobs:
         run: |
           mkdir build
           cd build
-          cmake .. -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON -DENABLE_MCP=OFF
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON -DENABLE_MCP=OFF
           cmake --build .
       - name: Check that the MCP server is left out
         run: |
@@ -267,7 +267,7 @@ jobs:
             mkdir build
             cd build
             git reset --hard
-            cmake .. -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
             cmake --build .
             cd ..
             mkdir emu_binaries
@@ -333,7 +333,7 @@ jobs:
             mkdir build
             cd build
             git reset --hard
-            cmake .. -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
             cmake --build .
             cd ..
             mkdir emu_binaries
@@ -390,7 +390,7 @@ jobs:
         run: |
           mkdir build
           cd build
-          cmake .. -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
           cmake --build .
       - name: Package Emulator
         run: |
@@ -446,7 +446,7 @@ jobs:
         run: |
           mkdir build
           cd build
-          cmake .. -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON
           cmake --build .
       - name: Package Emulator
         run: |
@@ -502,7 +502,7 @@ jobs:
           mkdir build
           cp latest_rom/rom.bin build
           cd build
-          emcmake cmake .. -DENABLE_FLUIDSYNTH=OFF -DENABLE_TRACE=OFF
+          emcmake cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_FLUIDSYNTH=OFF -DENABLE_TRACE=OFF
           emmake make
       - name: Package Emulator
         run: |
