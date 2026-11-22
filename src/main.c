@@ -525,6 +525,7 @@ usage()
 	printf("\tstdout carries only protocol messages; all other output goes to\n");
 	printf("\tstderr. Set X16EMU_MCP_LOG=1 to log the traffic on stderr.\n");
 	printf("\tNot compatible with -testbench.\n");
+	printf("\tOnly in builds with the MCP server (CMake option ENABLE_MCP).\n");
 	printf("-testbench\n");
 	printf("\tHeadless mode for unit testing with an external test runner\n");
 	printf("-mhz <integer>\n");

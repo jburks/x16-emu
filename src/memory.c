@@ -19,7 +19,7 @@
 #include "cartridge.h"
 #include "iso_8859_15.h"
 #include "midi.h"
-#include "mcp_internal.h"
+#include "mcp.h"
 
 uint8_t ram_bank;
 uint8_t rom_bank;
@@ -163,7 +163,7 @@ static const char *format_addr(uint16_t address, uint8_t bank, uint8_t x16Bank) 
 uint8_t
 read6502(uint16_t address, uint8_t bank) {
 	if (!is_gen2) bank = 0;
-	if (mcp_watch_active && bank == 0) {
+	if (mcp_cpu_watching() && bank == 0) {
 		mcp_watch_hit(address, false, real_read6502(address, 0, true, USE_CURRENT_X16_BANK));
 	}
 	// Report access to uninitialized RAM (if option selected)
@@ -274,7 +274,7 @@ void
 write6502(uint16_t address, uint8_t bank, uint8_t value)
 {
 	if (!is_gen2) bank = 0;
-	if (mcp_watch_active && bank == 0) {
+	if (mcp_cpu_watching() && bank == 0) {
 		mcp_watch_hit(address, true, value);
 	}
 

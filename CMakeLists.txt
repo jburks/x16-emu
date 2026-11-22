@@ -169,6 +169,16 @@ add_custom_command(
 # Create a target so the main executable can depend on it
 add_custom_target(gen_cpu_tables DEPENDS ${TABLE_OUTPUT_H})
 
+# MCP server (-mcp): lets an AI agent or other MCP client inspect and drive the emulator over stdio.
+# When OFF, its hooks in the emulator compile to nothing (see src/mcp.h). Not available for wasm builds.
+
+option(ENABLE_MCP "Build the MCP server (-mcp)" ON)
+
+set(USE_MCP FALSE)
+if(ENABLE_MCP AND NOT EMSCRIPTEN)
+    set(USE_MCP TRUE)
+endif()
+
 # --- Sources ---
 set(X16_SOURCES
     src/cpu/fake6502.c
@@ -196,13 +206,6 @@ set(X16_SOURCES
     src/timing.c
     src/wav_recorder.c
     src/testbench.c
-    src/mcp.c
-    src/mcp_json.c
-    src/mcp_tools.c
-    src/mcp_debug.c
-    src/mcp_hash.c
-    src/mcp_paths.c
-    src/mcp_symbols.c
     src/files.c
     src/cartridge.c
     src/iso_8859_15.c
@@ -213,6 +216,18 @@ set(X16_SOURCES
 
 if(WIN32)
     list(APPEND X16_SOURCES src/video_win32.c)
+endif()
+
+if(USE_MCP)
+    list(APPEND X16_SOURCES
+        src/mcp.c
+        src/mcp_json.c
+        src/mcp_tools.c
+        src/mcp_debug.c
+        src/mcp_hash.c
+        src/mcp_paths.c
+        src/mcp_symbols.c
+    )
 endif()
 
 # --- Main Executable Target ---
@@ -234,6 +249,10 @@ target_include_directories(x16emu PRIVATE
 
 if(USE_TRACE)
     target_compile_definitions(x16emu PRIVATE TRACE)
+endif()
+
+if(USE_MCP)
+    target_compile_definitions(x16emu PRIVATE MCP)
 endif()
 
 # Linking
@@ -356,17 +375,26 @@ else()
     set(TRACE_EN_MSG "DISABLED (Explicit)")
 endif()
 
+if(USE_MCP)
+    set(MCP_EN_MSG "${ColorGreen}ENABLED${ColorReset}")
+elseif(EMSCRIPTEN)
+    set(MCP_EN_MSG "DISABLED (not available for wasm)")
+else()
+    set(MCP_EN_MSG "DISABLED (Explicit)")
+endif()
+
 message(STATUS "\n")
 message(STATUS "=========================================================================")
 message(STATUS "   x16-emulator Build Options Summary")
 message(STATUS "=========================================================================")
 message(STATUS "   Fluidsynth Support : ${FLUID_EN_MSG}")
 message(STATUS "   Trace Support      : ${TRACE_EN_MSG}")
+message(STATUS "   MCP Server         : ${MCP_EN_MSG}")
 message(STATUS "=========================================================================\n")
 
 # Regression tests for the MCP server (tests/mcp). They run the emulator windowless (-nowindow).
 # Build and run with: make mcp-test
-if(NOT EMSCRIPTEN)
+if(USE_MCP)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)
         add_custom_target(mcp-test

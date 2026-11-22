@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include "mcp.h"
 #include "mcp_json.h"
 
 // A tool call in flight. Created by the reader thread, run on the EMULATOR
@@ -79,9 +80,7 @@ extern mcp_stop_info mcp_last_stop;
 extern int mcp_bp_active; // number of breakpoints
 // True while anything needs mcp_debug_check() each pass (breakpoints, a step in progress, a pending watch hit).
 extern bool mcp_debug_armed;
-// Number of watchpoints; memory.c checks it on every CPU access so it must stay a plain int.
-extern int mcp_watch_active;  // number of CPU-space watchpoints
-extern int mcp_vwatch_active; // number of VRAM watchpoints (video.c checks this on every VRAM write)
+// mcp_watch_active and mcp_vwatch_active (the watchpoint counts the emulator tests) are in mcp.h.
 
 #define MCP_MAX_BREAKPOINTS 64
 int mcp_bp_add(uint16_t address, int bank, bool *existed); // bank -1 = any; returns id, or -1 if full
@@ -101,11 +100,7 @@ void mcp_watch_clear(void);
 int mcp_watch_total(void);
 bool mcp_watch_get(int index, int *id, int *space, uint32_t *address, uint32_t *length, int *bank, int *access,
                    bool *exclude_fetch, unsigned *hits);
-// Called from read6502/write6502 only when mcp_watch_active != 0.
-void mcp_watch_hit(uint16_t address, bool write, uint8_t value);
-// Called from video.c after the CPU stores a byte in VRAM through a data port (port 0 or 1), only when
-// mcp_vwatch_active != 0. value is the byte now in VRAM.
-void mcp_vram_watch_hit(uint32_t address, uint8_t value, int port);
+// mcp_watch_hit() and mcp_vram_watch_hit(), the hooks the emulator calls, are declared in mcp.h.
 // Set while a tool performs its own memory accesses, so they do not trigger watchpoints.
 extern bool mcp_watch_suppress;
 // Starts executing `n` instructions from the paused state, then pauses (STOP_STEP).

@@ -16,6 +16,13 @@ x16emu -mcp
 All the usual options still work (`-rom`, `-sdcard`, `-prg`, `-run`, `-zeroram`,
 `-warp`, `-nowindow`, ...), except `-testbench`, which cannot be combined with `-mcp`.
 
+The server is a build option, `ENABLE_MCP` (on by default; not available for
+the WebAssembly build). Build without it with `cmake -DENABLE_MCP=OFF`: the
+emulator then contains none of the MCP code, its hooks in the CPU memory access
+and VERA write paths compile to nothing, and `-mcp` exits with a message saying
+the server is not built in. The CMake build summary shows the setting as
+`MCP Server`.
+
 ## Attaching an agent
 
 The server uses the **stdio** transport: the client starts the emulator as a
@@ -567,6 +574,7 @@ has the helpers (`Emu`, `check`, `wait_screen`, ...).
 
 | File | Contents |
 |---|---|
+| `src/mcp.h` | The only MCP header the rest of the emulator includes: the entry points and the watchpoint hooks, with empty inline stubs when `MCP` is not defined |
 | `src/mcp.c` | Transport, JSON-RPC handling, the reader thread, the job queue and pause handling |
 | `src/mcp_tools.c` | The tool implementations and the tool table |
 | `src/mcp_debug.c` | Breakpoints, watchpoints, stepping and stop state |
@@ -580,6 +588,14 @@ A thread reads and parses requests; each `tools/call` becomes a job that the
 emulator state without locks. A tool's `run()` returns `true` when it is done;
 returning `false` makes it be polled again on the next pass, which is how the
 waiting tools run while the emulator keeps executing.
+
+The server is compiled only when `MCP` is defined (CMake `ENABLE_MCP`, which
+also decides whether the `src/mcp*.c` files are built). Code outside those files
+calls MCP only through `mcp.h`, so it needs no `#ifdef`: without `MCP`,
+`mcp_enabled` is the constant `false`, `mcp_cpu_watching()` and
+`mcp_vram_watching()` return `false`, and the other functions are empty, so the
+compiler removes the hooks. A new hook in emulator code belongs in `mcp.h`, with
+a stub in its `#else` branch.
 
 To add a tool: write a `run(mcp_job *job)` function and a `mcp_tool` struct
 (name, description, JSON schema), then add it to the table in `mcp_tool_table()`.

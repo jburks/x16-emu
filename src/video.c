@@ -9,7 +9,7 @@
 #endif
 
 #include "video.h"
-#include "mcp_internal.h"
+#include "mcp.h"
 #include "memory.h"
 #include "glue.h"
 #include "debugger.h"
@@ -106,7 +106,7 @@ static int vwatch_port = -1;
 static inline void
 vram_written(uint32_t address)
 {
-	if (mcp_vwatch_active) {
+	if (mcp_vram_watching()) {
 		mcp_vram_watch_hit(address & 0x1FFFF, video_ram[address & 0x1FFFF], vwatch_port);
 	}
 }
