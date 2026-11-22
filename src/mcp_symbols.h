@@ -10,25 +10,41 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Loads a VICE-format label file: lines "al <hex address> .<name>" (an optional "C:" before the address is
-// accepted). The address is read as bank:address when it has more than four hex digits (ld65 for the X16
-// puts the bank in the upper byte). Other lines are skipped. With replace, the existing symbols are dropped
-// first. Returns false with a message in err if the file cannot be read or has no label lines.
-bool mcp_sym_load(const char *path, bool replace, size_t *added, size_t *skipped_lines, char *err, size_t err_size);
+typedef struct {
+	size_t added;      // labels read from the file
+	size_t skipped;    // lines (label file) or symbol records (debug info) that were not labels
+	size_t merged;     // labels dropped because the same label (address, bank, name) was already there
+	size_t scopes;     // address ranges of named scopes (debug info only)
+	bool debug_info;   // the file was cc65 debug info, not a label file
+} mcp_sym_load_info;
+
+// Loads labels from either kind of file, told apart by content:
+// - a VICE-format label file (ld65 -Ln): lines "al <hex address> .<name>" (an optional "C:" before the address is
+//   accepted). The address is read as bank:address when it has more than four hex digits (ld65 for the X16 puts
+//   the bank in the upper byte). Other lines are skipped.
+// - cc65 debug info (ld65 --dbgfile, version 2.x): every label, and every constant that is an address (has a
+//   segment) or is exported (the set ld65 -Ln writes), named with its scope path ("tslope::sign"); plus the address ranges of named scopes.
+// With replace, the existing symbols are dropped first. A label already loaded (same address, bank and name) is
+// kept once, preferring the scoped name, so a program's label file and debug info can both be loaded. Returns false
+// with a message in err if the file cannot be read or has no labels (the loaded symbols are then unchanged).
+bool mcp_sym_load(const char *path, bool replace, mcp_sym_load_info *info, char *err, size_t err_size);
 
 size_t mcp_sym_count(void);
 
-// Resolves "name", "name+N" or "name-N" (N decimal, 0x or $ hex). *bank is the symbol's bank, or -1 if it
-// has none (addresses below $A000, and labels without a bank). On failure err says why.
+// Resolves "name", "name+N" or "name-N" (N decimal, 0x or $ hex). name is a full name with its scope path
+// ("tslope::sign") or, if no full name matches, a label without one ("sign"); "name@$XXXX" picks the label of
+// that name at that address. A name that several labels have is an error listing them. *bank is the symbol's
+// bank, or -1 if it has none (addresses below $A000, and labels without a bank). On failure err says why.
 bool mcp_sym_find(const char *expr, uint16_t *address, int *bank, char *err, size_t err_size);
 
-// Describes an address as "name" or "name+0xN" using the nearest label at or below it, if there is one
+// Describes an address as "name" or "name+0xN" (name: the scope path and label, with @$XXXX added when other
+// labels have the same name) using the nearest label at or below it, if there is one
 // within 4096 bytes, in the same memory region, and (from $A000 up) in the current RAM or ROM bank. Linker
 // symbols such as __X_SIZE__ are not offered. Returns false if there is no such label.
 bool mcp_sym_describe(uint16_t address, char *out, size_t out_size);
 
 typedef struct {
-	const char *name;  // valid until the symbols are next loaded
+	const char *name;  // as shown (see mcp_sym_describe); valid until the symbols are next loaded
 	uint16_t address;
 	int bank;          // -1: none
 } mcp_sym_entry;
@@ -44,5 +60,8 @@ bool mcp_sym_nearest(uint16_t address, int bank, mcp_sym_entry *out);
 // matches in total, not just the stored ones, goes to *matching.
 size_t mcp_sym_list(const char *prefix, const char *contains, bool include_linker, bool by_address,
                     size_t offset, size_t limit, mcp_sym_entry *out, size_t *matching);
+
+// Number of address ranges of named scopes loaded from debug info.
+size_t mcp_sym_scope_count(void);
 
 #endif

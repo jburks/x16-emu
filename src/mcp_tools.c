@@ -1606,7 +1606,7 @@ run_load_symbols(mcp_job *job)
 	const json_node *pn = json_get(job->args, "path");
 	const char *path = json_as_string(pn);
 	if (!path || !path[0] || pn->string_len != strlen(path)) {
-		mcp_job_fail(job, "path is required: a ca65/ld65 label file (ld65 -Ln), lines like \"al 000801 .main\"");
+		mcp_job_fail(job, "path is required: a ca65/ld65 label file (ld65 -Ln, lines like \"al 000801 .main\") or cc65 debug info (ld65 --dbgfile)");
 		return true;
 	}
 	const json_node *rn = json_get(job->args, "replace");
@@ -1618,14 +1618,16 @@ run_load_symbols(mcp_job *job)
 	if (!host_path(job, path, resolved, sizeof(resolved))) {
 		return true;
 	}
-	size_t added, skipped;
+	mcp_sym_load_info info;
 	char err[700];
-	if (!mcp_sym_load(resolved, rn && rn->boolean, &added, &skipped, err, sizeof(err))) {
+	if (!mcp_sym_load(resolved, rn && rn->boolean, &info, err, sizeof(err))) {
 		mcp_job_fail(job, err);
 		return true;
 	}
-	char tmp[200];
-	snprintf(tmp, sizeof(tmp), "{\"loaded\":%zu,\"skipped_lines\":%zu,\"total\":%zu,\"replaced\":%s}", added, skipped,
+	char tmp[300];
+	snprintf(tmp, sizeof(tmp), "{\"format\":\"%s\",\"loaded\":%zu,\"%s\":%zu,\"merged\":%zu,\"scopes\":%zu,"
+	         "\"total\":%zu,\"replaced\":%s}", info.debug_info ? "debug_info" : "labels", info.added,
+	         info.debug_info ? "skipped_symbols" : "skipped_lines", info.skipped, info.merged, mcp_sym_scope_count(),
 	         mcp_sym_count(), rn && rn->boolean ? "true" : "false");
 	json_buf_append(&job->text, tmp);
 	return true;
@@ -1634,14 +1636,20 @@ run_load_symbols(mcp_job *job)
 static const mcp_tool tool_load_symbols = {
 	"load_symbols",
 	"Loads labels from a ca65/ld65 label file (written by ld65 -Ln, VICE format: lines like \"al 000801 .main\"; "
-	"an address with more than four hex digits carries the bank in the upper byte, as in the X16 ROM's labels). "
-	"Afterwards any `address` (or `pc` for set_registers) may be a label name, or \"name+4\" / \"name-2\" (offset in "
-	"decimal or 0x/$ hex), in read_memory, hash_memory, write_memory, set_breakpoint, set_watchpoint, load_prg and "
-	"set_registers; a label with a bank supplies it when you give none. Stops and get_registers then report the "
-	"label too, as \"symbol\": \"name+0x12\" (the nearest label at or below, within 4096 bytes; for addresses from "
-	"$A000 up only labels for the current bank; linker symbols like __X_SIZE__ are skipped). Labels are "
-	"case-sensitive. Symbols are added to those already loaded unless replace is true. The path must lie inside "
-	"the host path root, as for load_prg.",
+	"an address with more than four hex digits carries the bank in the upper byte, as in the X16 ROM's labels) or "
+	"from cc65 debug info (ld65 --dbgfile; told apart by content). Debug info names labels by their scope: a label "
+	"inside a .proc is \"proc::label\" (nested: \"outer::inner::label\"), top-level labels stay plain; prefer it "
+	"when a program reuses local names. Afterwards any `address` (or `pc` for set_registers) may be a label: the "
+	"full name, a bare label if only one label has it, or \"name@$XXXX\" for the one at that address; plus \"+4\" / "
+	"\"-2\" (decimal or 0x/$ hex), in read_memory, hash_memory, write_memory, set_breakpoint, set_watchpoint, "
+	"load_prg, disassemble, profile_report and set_registers. A name several labels share is an error listing them. "
+	"A label with a bank supplies it when you give none. Results then name addresses, as \"symbol\": "
+	"\"proc::label+0x12\" (the nearest label at or below, within 4096 bytes; from $A000 up only labels for the "
+	"current bank; linker symbols like __X_SIZE__ are skipped); a name that several labels still share after that "
+	"is shown as \"name@$XXXX\". Labels are case-sensitive. Symbols are added to those already loaded unless replace "
+	"is true; a label loaded twice (same address, bank and name) is kept once, preferring the scoped name, so a "
+	"program's label file and debug info can both be loaded. The result gives format (labels or debug_info), loaded, "
+	"merged, scopes and total. The path must lie inside the host path root, as for load_prg.",
 	"{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"replace\":{\"type\":\"boolean\",\"default\":false}},"
 	"\"required\":[\"path\"],\"additionalProperties\":false}",
 	run_load_symbols,

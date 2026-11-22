@@ -445,16 +445,17 @@ Load the labels of the program under test and use names instead of addresses.
 
 | Tool | Arguments | What it does |
 |---|---|---|
-| `load_symbols` | `path`\*, `replace` | Loads a ca65/ld65 label file, as written by `ld65 -Ln file.sym`: VICE-format lines such as `al 000801 .main`. Other lines are skipped and counted. Labels are added to those already loaded unless `replace: true`; a file with no labels changes nothing. The path must lie inside the host path root. |
-| `lookup_symbol` | `name` or `address` | `name` (`main`, `main+4`) returns the address and bank; `address` returns the nearest label at or below it, as `name+0xN`, or `null`. |
+| `load_symbols` | `path`\*, `replace` | Loads labels from a ca65/ld65 label file (`ld65 -Ln file.sym`: VICE-format lines such as `al 000801 .main`; other lines are skipped and counted) or from cc65 debug info (`ld65 --dbgfile file.dbg`), told apart by content. Labels are added to those already loaded unless `replace: true`; a file with no labels changes nothing. Returns `format` (`labels` or `debug_info`), `loaded`, `merged`, `scopes` and `total`. The path must lie inside the host path root. |
+| `lookup_symbol` | `name` or `address` | `name` (`main`, `main+4`, `draw::loop`, `next@$1A24`) returns the address and bank; `address` returns the nearest label at or below it, as `name+0xN`, or `null`. |
 | `list_symbols` | `prefix`, `contains`, `include_linker`, `sort`, `limit`, `offset` | Lists the loaded symbols, to check what `load_symbols` read or to find entry points without guessing names (`prefix: "vex_"`). `prefix` keeps names that start with it and `contains` names that contain it (case-sensitive; both must match). Linker symbols such as `__BSS_SIZE__` are left out unless `include_linker: true`. `sort` is `name` (default) or `address`. Paged by `limit` (default 100, at most 1000) and `offset`. Returns `loaded`, `matching`, `returned` and the symbols as `name`, `address` and `bank` (`null` if none). |
 
 Once symbols are loaded:
 
 - **Anywhere an address goes**, a label name works: the `address` of
   `read_memory`, `hash_memory`, `write_memory`, `set_breakpoint`,
-  `set_watchpoint` and `load_prg`, and the `pc` of `set_registers`. `name+N` and
-  `name-N` add or subtract an offset (decimal, `0x` or `$` hex). Labels are
+  `set_watchpoint`, `load_prg` and `disassemble`, the `from`, `to` and `within`
+  of `profile_report`, and the `pc` of `set_registers`. `name+N` and `name-N`
+  add or subtract an offset (decimal, `0x` or `$` hex). Labels are
   case-sensitive. An unknown name is an error that says so.
 - **Banks:** a label whose value has bits above the low 16 carries a bank in the
   upper byte (`al 0AC123 .x` is `$C123` in bank 10, as in the X16 ROM's label
@@ -473,8 +474,46 @@ Once symbols are loaded:
   in a result for a data address is a position in the table, not an instruction.
   (Stop results name `pc`, which is code; `lookup_symbol` and the watchpoint
   addresses can be data.)
-- Only the **ca65/ld65 label format** is read. Debug-info (`.dbg`) and map files
-  are not.
+- Map files are not read.
+
+**Debug info and scopes.** The label file has no scopes: a label inside a
+`.proc` comes out as a bare name, so a program that reuses local names (`loop`,
+`next`, `done` in many routines) gets several labels with the same name. cc65's
+debug info (`ld65 --dbgfile`, add `-g` to `ca65`) keeps the scopes, and
+`load_symbols` reads it:
+
+- Labels are named by their **scope path**, in cc65's syntax: `tslope::sign`,
+  and `outer::inner::loop` for nested scopes. Top-level labels stay plain
+  (`vex_project_verts`). That name is used everywhere a name is reported:
+  `symbol` in stop results and `get_registers`, `disassemble`'s `label`,
+  `target_symbol` and `operand_symbol`, `profile_report`, `lookup_symbol` and
+  `list_symbols`.
+- **As input**, give the full path (`procB::loop`), or a bare label when only
+  one label has it (`procA`). A partial path (`inner::loop` for
+  `outer::inner::loop`) is not a name.
+- The debug info gives every label, and every constant that is an address (it
+  has a segment) or that another module imports: the same set `ld65 -Ln`
+  writes, except the linker's own symbols (`__BSS_SIZE__`, ...), which are only
+  in the label file. A constant that is exported but not imported by any module
+  cannot be recognised as exported in the debug info and is not loaded. Plain
+  number constants (`COUNT = 3`) are never loaded.
+- You can load a program's label file and its debug info, in either order. A
+  label that is in both (same address, bank and name) is kept once, with its
+  scoped name; `merged` counts them.
+- Debug info has no X16 banks: labels from it carry none, like a label file
+  with four-digit addresses.
+
+**Names several labels share.** Whatever is loaded, a name that more than one
+label has is never resolved silently:
+
+- As **input**, it is an error that lists the candidates: `'next' is
+  ambiguous: 9 labels have that name: draw_mesh_wire::next, tri_fill::next, ...`.
+  Give the scope path, or `name@$XXXX` for the label at that address
+  (`next@$1A24`, also with an offset: `next@$1A24+2`).
+- In **results**, a name that is still shared (always the case for local names
+  when only a label file is loaded) is shown with its address, `next@$1A24`, so
+  a report cannot mix two labels up, and the name can be used as input as it
+  is.
 
 ### Profile
 
