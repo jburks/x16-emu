@@ -182,6 +182,50 @@ jobs:
         with:
           name: x16emu_linux-x86_64
           path: emu_binaries/*
+  build-linux-x86_64-no-mcp:
+    # Builds without the MCP server (ENABLE_MCP=OFF) to keep that configuration compiling;
+    # otherwise the same as build-linux-x86_64. No artifacts.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential make libsdl2-dev libfluidsynth-dev cmake
+      - name: Fetch latest ROM
+        if: startsWith(github.ref, 'refs/tags/r') != true
+        run: |
+          gh run download -R X16Community/x16-rom -n "ROM Image" --dir latest_rom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch latest release ROM
+        if: startsWith(github.ref, 'refs/tags/r')
+        run: |
+          gh run download -R X16Community/x16-rom -n "Release ROM Image" --dir latest_rom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Copy ROM symbols
+        run: |
+          cp latest_rom/*.h src/.
+      - name: Build Emulator
+        run: |
+          mkdir build
+          cd build
+          cmake .. -DENABLE_FLUIDSYNTH=ON -DENABLE_TRACE=ON -DENABLE_MCP=OFF
+          cmake --build .
+      - name: Check that the MCP server is left out
+        run: |
+          if nm build/x16emu | grep -q ' mcp_'; then echo "mcp symbols found in a build without MCP"; exit 1; fi
+          set +e
+          build/x16emu -mcp -nowindow > out.txt 2>&1 < /dev/null
+          status=$?
+          set -e
+          cat out.txt
+          test "$status" -eq 1
+          grep -q "built without the MCP server" out.txt
   build-linux-aarch64:
     needs: [README]
     runs-on: ubuntu-24.04
