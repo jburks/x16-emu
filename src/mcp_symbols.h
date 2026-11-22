@@ -64,4 +64,14 @@ size_t mcp_sym_list(const char *prefix, const char *contains, bool include_linke
 // Number of address ranges of named scopes loaded from debug info.
 size_t mcp_sym_scope_count(void);
 
+// The named scope (.proc or .scope, from debug info) whose address range holds address: the innermost one, or
+// with outermost the outermost. *path is its scope path (valid until the symbols are next loaded) and *start the
+// start of its range. Ranges above $FFFF (with a bank) only match that bank. False if no scope holds it.
+bool mcp_sym_scope_at(uint16_t address, int bank, bool outermost, const char **path, uint16_t *start);
+
+// Whether path is the full path of a loaded scope.
+bool mcp_sym_is_scope(const char *path);
+// Whether address lies in the scope path, or in a scope nested in it.
+bool mcp_sym_in_scope(uint16_t address, int bank, const char *path);
+
 #endif

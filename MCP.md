@@ -527,7 +527,7 @@ same profile every time.
 |---|---|---|
 | `profile_start` | `reset` | Starts counting. `reset` (default `true`) clears earlier counts; `false` adds to them. |
 | `profile_stop` | none | Stops counting and returns the totals. The counts are kept until the next `profile_start` with `reset`. |
-| `profile_report` | `by`, `sort`, `from`, `to`, `bank`, `within`, `limit`, `offset`, `path`, `overwrite` | The totals and the counted entries, highest cycles first. `by: "symbol"` (default) adds up the addresses of each label; `by: "address"` lists single instructions. |
+| `profile_report` | `by`, `scope_level`, `sort`, `from`, `to`, `bank`, `within`, `limit`, `offset`, `path`, `overwrite` | The totals and the counted entries, highest cycles first. `by: "symbol"` (default) adds up the addresses of each label; `by: "scope"` adds up each routine (needs debug info); `by: "address"` lists single instructions. |
 
 Every result starts with the totals:
 
@@ -552,7 +552,21 @@ belongs to the nearest label at or below it, as for `symbol` elsewhere, so load
 the program's labels with `load_symbols` first. Addresses without a label are
 grouped per memory region (`symbol: null`, `region`: `low memory`, `RAM bank 2`,
 `ROM bank 0`, ...). Inner labels (`@loop`, or a plain label inside a routine)
-start a group of their own, so a routine with inner labels shows up in parts.
+start a group of their own, so a routine with inner labels shows up in parts;
+`by: "scope"` puts it back together.
+
+Entries of `by: "scope"` give `scope` (the path, such as `tri_fill` or
+`outer::inner`), `address` (where the scope starts), `bank`, `cycles`,
+`percent` and `instructions`. Every address inside a `.proc` or `.scope` counts
+for that scope, whatever labels are inside it, so each routine is one entry.
+This needs the program's cc65 debug info loaded (see "Debug info and scopes"
+under Symbols), since label files have no scopes. Nested scopes count for the
+innermost one; with `scope_level: "outermost"` they count for the outermost
+one instead. Code outside every scope (top-level code, or code from files
+without debug info) is grouped by label as in `by: "symbol"`, with
+`scope: null`. For example, in one OtterVeX demo the label view showed
+`tri_fill::have` 6.8%, `tri_fill::row` 4.5% and `tri_fill::next` 3.5%; the
+scope view shows `tri_fill` as one entry at 19.7%.
 
 Entries of `by: "address"` give `address`, `bank`, `cycles`, `percent`, `count`
 (times executed), `symbol` (`name+0xN`) and `text` (the instruction as it is in
@@ -560,8 +574,10 @@ memory now). With `sort: "address"` they come in address order, to read a
 routine with the cost of each instruction.
 
 Filters: `from` and `to` (an inclusive range; numbers or labels), `bank` (for
-addresses from `$A000` up), and `within` (a label: only the addresses that
-belong to it). The report is paged by `limit` (default 50, at most 1000) and
+addresses from `$A000` up), and `within`: a scope path (with debug info loaded)
+keeps every address inside that scope, nested scopes included, so
+`within: "tri_fill"` is the whole routine; any other label keeps only the
+addresses that belong to that label. The report is paged by `limit` (default 50, at most 1000) and
 `offset`, and `entries_total` says how many there are. With `path` the whole
 report, every entry, is written to that host file as JSON (inside the host path
 root; an existing file is replaced only with `overwrite: true`), and only the
@@ -575,8 +591,8 @@ Tips:
   `run_frames` profiles whole frames.
 - **Several runs:** `profile_start` with `reset: false` adds another segment to
   the same counts.
-- **Find the hot instructions inside a routine:** `profile_report` with
-  `by: "address"`, `within: "draw_line"` and `sort: "address"`.
+- **Find the hot routines, then the hot instructions:** `by: "scope"` first,
+  then `by: "address"` with `within: "<the routine>"` and `sort: "address"`.
 - Profiling makes the emulator a little slower; stop it when you are done.
   `get_status` shows `profiling`.
 - The profile counts cycles per address only. It does not know which routine

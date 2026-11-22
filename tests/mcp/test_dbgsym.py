@@ -92,6 +92,35 @@ check("profile_report names the scoped labels", got == ["outer", "outer::inner",
 pa = e.ok("profile_report", {"by": "address", "within": "procB::loop", "sort": "address"})
 check("profile_report within a scope path", [x["address"] for x in pa["entries"]] == ["0x%04X" % a for a in (PROCB_LOOP, PROCB_LOOP + 1, PROCB_LOOP + 3)], pa["entries"])
 
+# profile by scope: a routine with its inner labels is one entry
+sc = e.ok("profile_report", {"by": "scope", "limit": 100})
+ent = {x["scope"] if x["scope"] else "label:" + x["symbol"]: x for x in sc["entries"]}
+check("by scope: one entry per routine (innermost), top-level code by label",
+      sorted(ent) == ["label:start", "outer", "outer::inner", "procA", "procB"], sorted(ent))
+check("by scope: an entry gives the scope's start address", ent["procA"]["address"] == "0x%04X" % PROCA and ent["outer::inner"]["address"] == "0x%04X" % INNER, ent["procA"])
+bysym = {x["symbol"]: x for x in pr["entries"]}
+check("by scope: a routine adds up its inner labels", ent["procA"]["cycles"] == bysym["procA"]["cycles"] + bysym["procA::loop"]["cycles"]
+      and ent["procA"]["instructions"] == bysym["procA"]["instructions"] + bysym["procA::loop"]["instructions"], (ent["procA"], bysym["procA"], bysym["procA::loop"]))
+check("by scope: the nested scope is apart from its parent (innermost)", ent["outer"]["cycles"] == bysym["outer"]["cycles"]
+      and ent["outer::inner"]["cycles"] == bysym["outer::inner"]["cycles"] + bysym["outer::inner::loop"]["cycles"])
+check("by scope: code outside every scope has scope null and its label", ent["label:start"]["scope"] is None and ent["label:start"]["cycles"] == bysym["start"]["cycles"])
+check("by scope: entries add up to instruction_cycles", sum(x["cycles"] for x in sc["entries"]) == sc["instruction_cycles"])
+check("by scope: highest cycles first", [x["cycles"] for x in sc["entries"]] == sorted((x["cycles"] for x in sc["entries"]), reverse=True))
+so = e.ok("profile_report", {"by": "scope", "scope_level": "outermost", "limit": 100})
+ento = {x["scope"] if x["scope"] else "label:" + x["symbol"]: x for x in so["entries"]}
+check("scope_level outermost rolls nested scopes up", sorted(ento) == ["label:start", "outer", "procA", "procB"]
+      and ento["outer"]["cycles"] == ent["outer"]["cycles"] + ent["outer::inner"]["cycles"], sorted(ento))
+wa = e.ok("profile_report", {"by": "address", "within": "procA", "sort": "address"})
+check("within a scope path: the whole routine, inner labels included",
+      [x["address"] for x in wa["entries"]] == ["0x%04X" % a for a in (PROCA, PROCA + 2, PROCA + 3, PROCA + 5)], wa["entries"])
+wo = e.ok("profile_report", {"by": "address", "within": "outer"})
+check("within a scope path includes nested scopes", sorted(x["symbol"].split("+")[0] for x in wo["entries"]) ==
+      sorted(["outer", "outer", "outer::inner", "outer::inner::loop", "outer::inner::loop", "outer::inner::loop"]), [x["symbol"] for x in wo["entries"]])
+wl = e.ok("profile_report", {"by": "address", "within": "procA::loop", "sort": "address"})
+check("within a label that is not a scope: that label's addresses", [x["address"] for x in wl["entries"]] == ["0x%04X" % a for a in (PROCA_LOOP, PROCA_LOOP + 1, PROCA_LOOP + 3)], wl["entries"])
+err, t = e.call("profile_report", {"scope_level": "outermost"}); check("scope_level needs by scope", err and "scope_level" in t, t)
+err, t = e.call("profile_report", {"by": "scope", "scope_level": "x"}); check("scope_level must be innermost or outermost", err and "scope_level" in t, t)
+
 # ---- the label file on top: merged, scoped names kept ----
 r = e.ok("load_symbols", {"path": "scoped.sym"})
 check("the label file (14 lines, procA and procB twice) merges into the debug info", r["format"] == "labels" and r["loaded"] == 14 and r["merged"] == 14 and r["total"] == 13, r)
@@ -104,6 +133,8 @@ check("without scopes, a shared name is shown with its address", name_of(PROCA_L
 err, t = e.call("lookup_symbol", {"name": "loop"}); check("and is ambiguous as input", err and "loop@$%04X" % PROCB_LOOP in t, t)
 check("name@$XXXX works for the label file", addr_of("loop@$%04X" % INNER_LOOP) == INNER_LOOP)
 check("unique names are unchanged", name_of(PROCA) == "procA" and name_of(TABLE) == "table")
+
+err, t = e.call("profile_report", {"by": "scope"}); check("by scope without debug info says to load it", err and "debug info" in t, t)
 
 # ---- errors ----
 open(os.path.join(tmp, "v3.dbg"), "w").write("version\tmajor=3,minor=0\nsym\tid=0,name=\"x\",val=0x10,type=lab\n")

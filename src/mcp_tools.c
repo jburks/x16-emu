@@ -2508,8 +2508,9 @@ typedef struct {
 	int16_t bank;          // -1 below $A000
 	uint64_t count;
 	uint64_t cycles;
-	const char *sym;       // nearest label (filled when needed), NULL if none
+	const char *sym;       // nearest label (filled when needed), NULL if none; for by scope the scope's path
 	uint16_t sym_address;
+	bool is_scope;         // sym is a scope path (by scope), not a label
 } prof_row;
 
 typedef struct {
@@ -2540,6 +2541,7 @@ prof_collect(void *ctx, uint16_t address, int bank, uint64_t cycles, uint64_t co
 	row->cycles = cycles;
 	row->sym = NULL;
 	row->sym_address = 0;
+	row->is_scope = false;
 }
 
 // A memory region: -1 below $A000, the RAM bank for $A000-$BFFF, 256 + the ROM bank from $C000 up.
@@ -2563,6 +2565,7 @@ static int
 prof_by_group(const void *a, const void *b)
 {
 	const prof_row *x = a, *y = b;
+	if (x->is_scope != y->is_scope) return x->is_scope ? -1 : 1;
 	if (x->sym != y->sym) {
 		if (!x->sym || !y->sym) return x->sym ? -1 : 1;
 		int c = strcmp(x->sym, y->sym);
@@ -2591,21 +2594,27 @@ prof_append_bank(json_buf *b, int bank)
 	}
 }
 
-// One entry of the symbol view: a group (row) whose cycles and count are the group's totals.
+// One entry of the symbol or scope view: a group (row) whose cycles and count are the group's totals.
 static void
-prof_append_group(json_buf *b, const prof_row *g, uint64_t total)
+prof_append_group(json_buf *b, const prof_row *g, uint64_t total, bool by_scope)
 {
 	char tmp[200];
-	json_buf_append(b, "{\"symbol\":");
-	if (g->sym) {
+	if (g->is_scope) { // by scope: a routine
+		json_buf_append(b, "{\"scope\":");
 		json_buf_append_string(b, g->sym, strlen(g->sym));
 		snprintf(tmp, sizeof(tmp), ",\"address\":\"0x%04X\"", g->sym_address);
 		json_buf_append(b, tmp);
-	} else {
+	} else if (g->sym) { // a label (by scope: code outside every scope)
+		json_buf_append(b, by_scope ? "{\"scope\":null,\"symbol\":" : "{\"symbol\":");
+		json_buf_append_string(b, g->sym, strlen(g->sym));
+		snprintf(tmp, sizeof(tmp), ",\"address\":\"0x%04X\"", g->sym_address);
+		json_buf_append(b, tmp);
+	} else { // no label: the memory region
+		json_buf_append(b, by_scope ? "{\"scope\":null,\"symbol\":null" : "{\"symbol\":null");
 		int region = prof_region(g);
-		if (region < 0) snprintf(tmp, sizeof(tmp), "null,\"region\":\"low memory\"");
-		else if (region < 256) snprintf(tmp, sizeof(tmp), "null,\"region\":\"RAM bank %d\"", region);
-		else snprintf(tmp, sizeof(tmp), "null,\"region\":\"ROM bank %d\"", region - 256);
+		if (region < 0) snprintf(tmp, sizeof(tmp), ",\"region\":\"low memory\"");
+		else if (region < 256) snprintf(tmp, sizeof(tmp), ",\"region\":\"RAM bank %d\"", region);
+		else snprintf(tmp, sizeof(tmp), ",\"region\":\"ROM bank %d\"", region - 256);
 		json_buf_append(b, tmp);
 	}
 	prof_append_bank(b, g->bank);
@@ -2658,18 +2667,34 @@ run_profile_report(mcp_job *job)
 	}
 	const json_node *byn = json_get(job->args, "by"), *sn = json_get(job->args, "sort"), *wn = json_get(job->args, "within");
 	const char *by = byn ? json_as_string(byn) : "symbol";
-	if (!by || (strcmp(by, "symbol") && strcmp(by, "address"))) {
-		mcp_job_fail(job, "by must be \"symbol\" or \"address\"");
+	if (!by || (strcmp(by, "symbol") && strcmp(by, "scope") && strcmp(by, "address"))) {
+		mcp_job_fail(job, "by must be \"symbol\", \"scope\" or \"address\"");
 		return true;
 	}
-	bool by_symbol = !strcmp(by, "symbol");
+	bool by_scope = !strcmp(by, "scope");
+	bool by_symbol = !strcmp(by, "symbol") || by_scope; // both group addresses
+	const json_node *ln = json_get(job->args, "scope_level");
+	const char *level = ln ? json_as_string(ln) : "innermost";
+	if (!level || (strcmp(level, "innermost") && strcmp(level, "outermost"))) {
+		mcp_job_fail(job, "scope_level must be \"innermost\" or \"outermost\"");
+		return true;
+	}
+	if (ln && !by_scope) {
+		mcp_job_fail(job, "scope_level applies to by \"scope\" only");
+		return true;
+	}
+	if (by_scope && !mcp_sym_scope_count()) {
+		mcp_job_fail(job, "by \"scope\" needs scopes, which come from cc65 debug info: load_symbols with the program's "
+		             ".dbg file (ld65 --dbgfile)");
+		return true;
+	}
 	const char *sort = sn ? json_as_string(sn) : "cycles";
 	if (!sort || (strcmp(sort, "cycles") && strcmp(sort, "address"))) {
 		mcp_job_fail(job, "sort must be \"cycles\" or \"address\"");
 		return true;
 	}
 	if (sn && by_symbol) {
-		mcp_job_fail(job, "sort applies to by \"address\" only (symbols are always ordered by cycles)");
+		mcp_job_fail(job, "sort applies to by \"address\" only (symbols and scopes are always ordered by cycles)");
 		return true;
 	}
 	const char *within = NULL;
@@ -2721,6 +2746,7 @@ run_profile_report(mcp_job *job)
 		mcp_job_fail(job, "out of memory");
 		return true;
 	}
+	bool within_scope = within && mcp_sym_is_scope(within); // a routine: its whole range, not just one label
 	// Name every row and apply the filters
 	size_t n = 0;
 	for (size_t i = 0; i < rows.n; i++) {
@@ -2732,7 +2758,14 @@ run_profile_report(mcp_job *job)
 			r.sym = e.name;
 			r.sym_address = e.address;
 		}
-		if (within && (!r.sym || strcmp(r.sym, within))) continue;
+		if (within && (within_scope ? !mcp_sym_in_scope(r.address, r.bank, within) : (!r.sym || strcmp(r.sym, within)))) continue;
+		const char *sp;
+		uint16_t ss;
+		if (by_scope && mcp_sym_scope_at(r.address, r.bank, !strcmp(level, "outermost"), &sp, &ss)) {
+			r.sym = sp;
+			r.sym_address = ss;
+			r.is_scope = true;
+		}
 		rows.rows[n++] = r;
 	}
 	// Symbol view: merge each label's rows (per region) into one, keeping the label's address
@@ -2769,7 +2802,7 @@ run_profile_report(mcp_job *job)
 	json_buf_append(out, tmp);
 	for (size_t i = 0; i < count; i++) {
 		if (i) json_buf_append(out, ",");
-		if (by_symbol) prof_append_group(out, &rows.rows[first + i], total);
+		if (by_symbol) prof_append_group(out, &rows.rows[first + i], total, by_scope);
 		else prof_append_address(out, &rows.rows[first + i], total);
 	}
 	json_buf_append(out, "]}");
@@ -2798,14 +2831,20 @@ static const mcp_tool tool_profile_report = {
 	"at or below each address, as in `symbol` elsewhere, so load the program's labels first (load_symbols); "
 	"addresses with no label are grouped per memory region (`region`). Entries give symbol, address, bank, cycles, "
 	"percent (of the profiled cycles) and instructions (executed). Inner labels split a routine, so read the names. "
+	"by \"scope\" (needs cc65 debug info loaded) adds up each routine instead: every address inside a .proc or "
+	".scope counts for that scope, inner labels included; entries give scope (the path), address (its start), "
+	"cycles, percent and instructions. Nested scopes count for the innermost one, or with scope_level \"outermost\" "
+	"for the outermost. Code outside every scope is grouped by label as in by \"symbol\", with scope null. "
 	"by \"address\" lists single instructions: address, bank, cycles, percent, count (times executed), symbol "
 	"(name+0xN) and text (the instruction as it is in memory now); sort \"address\" lists them in address order, to "
 	"read a routine with its costs. Filters: from/to (inclusive addresses or labels), bank (for $A000 up), within (a "
-	"label: only addresses that belong to it). Paged by limit (default 50, max 1000) and offset. With path the "
+	"scope path: every address inside that scope, nested ones included; otherwise a label: the addresses that belong "
+	"to it). Paged by limit (default 50, max 1000) and offset. With path the "
 	"whole report (every entry) is written to that host file as JSON, inside the host path root, and only the totals "
 	"are returned; an existing file is replaced only with overwrite.",
 	"{\"type\":\"object\",\"properties\":{"
-		"\"by\":{\"type\":\"string\",\"enum\":[\"symbol\",\"address\"],\"default\":\"symbol\"},"
+		"\"by\":{\"type\":\"string\",\"enum\":[\"symbol\",\"scope\",\"address\"],\"default\":\"symbol\"},"
+		"\"scope_level\":{\"type\":\"string\",\"enum\":[\"innermost\",\"outermost\"],\"default\":\"innermost\"},"
 		"\"sort\":{\"type\":\"string\",\"enum\":[\"cycles\",\"address\"],\"default\":\"cycles\"},"
 		"\"from\":{\"type\":[\"integer\",\"string\"]},\"to\":{\"type\":[\"integer\",\"string\"]},"
 		"\"bank\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255},"

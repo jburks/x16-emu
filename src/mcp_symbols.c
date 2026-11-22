@@ -861,3 +861,43 @@ mcp_sym_list(const char *prefix, const char *contains, bool include_linker, bool
 }
 
 size_t mcp_sym_scope_count(void) { return scope_count; }
+
+bool
+mcp_sym_scope_at(uint16_t address, int bank, bool outermost, const char **path, uint16_t *start)
+{
+	const scope_range_t *best = NULL;
+	// scopes are sorted by start; every range starting at or below address is a candidate
+	for (size_t i = 0; i < scope_count && (scopes[i].start & 0xFFFF) <= address; i++) {
+		const scope_range_t *r = &scopes[i];
+		if (r->start > 0xFFFF && (address < 0xA000 || (int)(r->start >> 16) != bank)) continue;
+		if ((uint32_t)address - (r->start & 0xFFFF) >= r->size) continue;
+		if (!best || (outermost ? r->size > best->size : r->size < best->size)) best = r;
+	}
+	if (!best) return false;
+	*path = best->path;
+	*start = (uint16_t)(best->start & 0xFFFF);
+	return true;
+}
+
+bool
+mcp_sym_is_scope(const char *path)
+{
+	for (size_t i = 0; i < scope_count; i++) {
+		if (!strcmp(scopes[i].path, path)) return true;
+	}
+	return false;
+}
+
+bool
+mcp_sym_in_scope(uint16_t address, int bank, const char *path)
+{
+	for (size_t i = 0; i < scope_count && (scopes[i].start & 0xFFFF) <= address; i++) {
+		const scope_range_t *r = &scopes[i];
+		if (r->start > 0xFFFF && (address < 0xA000 || (int)(r->start >> 16) != bank)) continue;
+		if ((uint32_t)address - (r->start & 0xFFFF) >= r->size) continue;
+		if (!strcmp(r->path, path) || (!strncmp(r->path, path, strlen(path)) && !strncmp(r->path + strlen(path), "::", 2))) {
+			return true; // that scope, or one nested in it
+		}
+	}
+	return false;
+}
