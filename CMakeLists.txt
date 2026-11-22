@@ -179,6 +179,16 @@ if(ENABLE_MCP AND NOT EMSCRIPTEN)
     set(USE_MCP TRUE)
 endif()
 
+# Profiler: cycles and execution counts per instruction address. Its only front end so far is the MCP server
+# (profile_start, profile_stop, profile_report), so it is built only together with it. When OFF, its hook in
+# the emulator loop compiles to a plain step6502() (see src/profiler.h).
+option(ENABLE_PROFILER "Build the profiler (used through the MCP server)" ON)
+
+set(USE_PROFILER FALSE)
+if(ENABLE_PROFILER AND USE_MCP)
+    set(USE_PROFILER TRUE)
+endif()
+
 # --- Sources ---
 set(X16_SOURCES
     src/cpu/fake6502.c
@@ -230,6 +240,10 @@ if(USE_MCP)
     )
 endif()
 
+if(USE_PROFILER)
+    list(APPEND X16_SOURCES src/profiler.c)
+endif()
+
 # --- Main Executable Target ---
 add_executable(x16emu ${X16_SOURCES})
 
@@ -253,6 +267,10 @@ endif()
 
 if(USE_MCP)
     target_compile_definitions(x16emu PRIVATE MCP)
+endif()
+
+if(USE_PROFILER)
+    target_compile_definitions(x16emu PRIVATE PROFILER)
 endif()
 
 # Linking
@@ -383,6 +401,14 @@ else()
     set(MCP_EN_MSG "DISABLED (Explicit)")
 endif()
 
+if(USE_PROFILER)
+    set(PROFILER_EN_MSG "${ColorGreen}ENABLED${ColorReset}")
+elseif(ENABLE_PROFILER)
+    set(PROFILER_EN_MSG "DISABLED (needs the MCP server)")
+else()
+    set(PROFILER_EN_MSG "DISABLED (Explicit)")
+endif()
+
 message(STATUS "\n")
 message(STATUS "=========================================================================")
 message(STATUS "   x16-emulator Build Options Summary")
@@ -390,6 +416,7 @@ message(STATUS "================================================================
 message(STATUS "   Fluidsynth Support : ${FLUID_EN_MSG}")
 message(STATUS "   Trace Support      : ${TRACE_EN_MSG}")
 message(STATUS "   MCP Server         : ${MCP_EN_MSG}")
+message(STATUS "   Profiler           : ${PROFILER_EN_MSG}")
 message(STATUS "=========================================================================\n")
 
 # Regression tests for the MCP server (tests/mcp). They run the emulator windowless (-nowindow).

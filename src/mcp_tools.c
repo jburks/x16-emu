@@ -21,6 +21,7 @@
 #include "cpu/fake6502.h"
 #include "mcp.h"
 #include "mcp_internal.h"
+#include "profiler.h"
 
 // timing.c: counted once per completed video frame
 extern uint32_t frames;
@@ -156,6 +157,9 @@ run_get_status(mcp_job *job)
 	} else {
 		json_buf_append(&job->text, "null");
 	}
+#ifdef PROFILER
+	json_buf_append(&job->text, profiler_on() ? ",\"profiling\":true" : ",\"profiling\":false");
+#endif
 	json_buf_append(&job->text, "}");
 	return true;
 }
@@ -1349,6 +1353,32 @@ is_relative_branch(uint8_t op)
 	       op == 0xD0 || op == 0xF0;
 }
 
+// Disassembles the instruction at pc into line: upper case, trailing blanks removed, relative branch targets as
+// four-digit addresses. Its bytes (up to four) go to b. Returns the length, or < 1 if it cannot be decoded.
+static int
+disasm_line(uint16_t pc, uint8_t prog_bank, int16_t x16bank, char *line, size_t size, int32_t *eff, uint8_t b[4])
+{
+	int len = disasm(pc, prog_bank, RAM, line, size, x16bank, regs.status, eff);
+	if (len < 1) {
+		return len;
+	}
+	memset(b, 0, 4);
+	for (int k = 0; k < len && k < 4; k++) {
+		b[k] = (uint8_t)debug_read6502((uint16_t)(pc + k), prog_bank, x16bank);
+	}
+	// text: lower case from the core, shown upper case; trailing blanks removed
+	size_t n = strlen(line);
+	while (n > 0 && line[n - 1] == ' ') line[--n] = 0;
+	for (size_t k = 0; k < n; k++) line[k] = (char)toupper((unsigned char)line[k]);
+	if (is_relative_branch(b[0])) {
+		char *sp = strchr(line, ' ');
+		if (sp) { // the core prints the target without padding ("BNE $610"): make it four digits
+			snprintf(sp, size - (size_t)(sp - line), " $%04X", (unsigned)((pc + 2 + (int8_t)b[1]) & 0xFFFF));
+		}
+	}
+	return len;
+}
+
 static bool
 run_disassemble(mcp_job *job)
 {
@@ -1389,7 +1419,8 @@ run_disassemble(mcp_job *job)
 	for (; done < count; done++) {
 		char line[96];
 		int32_t eff;
-		int len = disasm((uint16_t)pc, prog_bank, RAM, line, sizeof(line), x16bank, regs.status, &eff);
+		uint8_t b[4];
+		int len = disasm_line((uint16_t)pc, prog_bank, x16bank, line, sizeof(line), &eff, b);
 		if (len < 1) {
 			stopped = "the instruction could not be decoded";
 			break;
@@ -1398,21 +1429,9 @@ run_disassemble(mcp_job *job)
 			stopped = "the next instruction runs past the end of the address space";
 			break;
 		}
-		uint8_t b[4] = { 0 };
-		for (int k = 0; k < len && k < 4; k++) {
-			b[k] = (uint8_t)debug_read6502((uint16_t)(pc + (uint32_t)k), prog_bank, x16bank);
-		}
-		// text: lower case from the core, shown upper case; trailing blanks removed
-		size_t n = strlen(line);
-		while (n > 0 && line[n - 1] == ' ') line[--n] = 0;
-		for (size_t k = 0; k < n; k++) line[k] = (char)toupper((unsigned char)line[k]);
 		int target = -1;
 		if (is_relative_branch(b[0])) {
 			target = (int)((pc + 2 + (uint32_t)(int32_t)(int8_t)b[1]) & 0xFFFF);
-			char *sp = strchr(line, ' ');
-			if (sp) { // the core prints the target without padding ("BNE $610"): make it four digits
-				snprintf(sp, sizeof(line) - (size_t)(sp - line), " $%04X", target);
-			}
 		} else if (!regs.is65c816 && (b[0] & 0x0F) == 0x0F) { // BBRn / BBSn zp,rel
 			target = (int)((pc + 3 + (uint32_t)(int32_t)(int8_t)b[2]) & 0xFFFF);
 		} else if (b[0] == 0x4C || b[0] == 0x20) { // JMP abs, JSR abs
@@ -2373,6 +2392,426 @@ static const mcp_tool tool_mouse_wheel = {
 	NULL
 };
 
+// ---- profiler (profile_start / profile_stop / profile_report) ----
+
+#ifdef PROFILER
+
+// The profiled window in exact cycles: the sum of all start..stop segments since the last reset.
+static bool prof_started;          // profile_start has been called since launch
+static uint64_t prof_accum_cycles; // completed segments
+static uint64_t prof_segment_start;
+
+static uint64_t
+prof_window_cycles(void)
+{
+	return prof_accum_cycles + (profiler_on() ? mcp_total_cycles() - prof_segment_start : 0);
+}
+
+// "profiling":...,"cycles":...,... (no braces): where the profiled cycles went.
+static void
+prof_append_summary(json_buf *b)
+{
+	profiler_totals t;
+	profiler_get_totals(&t);
+	uint64_t total = prof_window_cycles();
+	long long other = (long long)(total - t.instruction_cycles - t.wait_cycles - t.unmapped_cycles);
+	char tmp[400];
+	snprintf(tmp, sizeof(tmp),
+	         "\"profiling\":%s,\"cycles\":%llu,\"instruction_cycles\":%llu,\"wait_cycles\":%llu,\"other_cycles\":%lld,"
+	         "\"unmapped_cycles\":%llu,\"instructions\":%llu",
+	         profiler_on() ? "true" : "false", (unsigned long long)total, (unsigned long long)t.instruction_cycles,
+	         (unsigned long long)t.wait_cycles, other, (unsigned long long)t.unmapped_cycles,
+	         (unsigned long long)t.instructions);
+	json_buf_append(b, tmp);
+}
+
+static bool
+run_profile_start(mcp_job *job)
+{
+	const json_node *r = json_get(job->args, "reset");
+	if (r && r->type != JSON_BOOL) {
+		mcp_job_fail(job, "reset must be true or false");
+		return true;
+	}
+	bool reset = !r || r->boolean;
+	bool was_on = profiler_on();
+	if (!profiler_start(reset)) {
+		mcp_job_fail(job, "out of memory for the profile");
+		return true;
+	}
+	if (reset) {
+		prof_accum_cycles = 0;
+	} else if (was_on) {
+		prof_accum_cycles += mcp_total_cycles() - prof_segment_start;
+	}
+	prof_segment_start = mcp_total_cycles();
+	prof_started = true;
+	char tmp[200];
+	snprintf(tmp, sizeof(tmp), "{\"profiling\":true,\"reset\":%s,\"cycles_at_start\":%llu}", reset ? "true" : "false",
+	         (unsigned long long)prof_segment_start);
+	json_buf_append(&job->text, tmp);
+	return true;
+}
+
+static const mcp_tool tool_profile_start = {
+	"profile_start",
+	"Starts the profiler: from now on, every instruction the CPU executes adds its cycles and one execution to a "
+	"counter for its address (and bank, from $A000 up). The counts are exact, in emulated cycles, and nothing is "
+	"sampled, so the same code gives the same profile every time. Tool calls take no emulated time, so starting "
+	"while paused at a breakpoint and stopping at another (or around run_frames) profiles exactly that stretch. "
+	"reset (default true) clears earlier counts; reset false adds to them. Profiling slows the emulator down a "
+	"little; profile_stop ends it. Read the results with profile_report.",
+	"{\"type\":\"object\",\"properties\":{\"reset\":{\"type\":\"boolean\",\"default\":true}},\"additionalProperties\":false}",
+	run_profile_start,
+	0
+};
+
+static bool
+run_profile_stop(mcp_job *job)
+{
+	if (!prof_started) {
+		mcp_job_fail(job, "the profiler has not been started (call profile_start)");
+		return true;
+	}
+	if (profiler_on()) {
+		prof_accum_cycles += mcp_total_cycles() - prof_segment_start;
+		profiler_stop();
+	}
+	json_buf_append(&job->text, "{");
+	prof_append_summary(&job->text);
+	json_buf_append(&job->text, "}");
+	return true;
+}
+
+static const mcp_tool tool_profile_stop = {
+	"profile_stop",
+	"Stops the profiler. The counts are kept for profile_report until the next profile_start with reset. Returns "
+	"the totals: cycles (the profiled window), instruction_cycles (spent in instructions, the sum of the report's "
+	"entries), wait_cycles (in WAI, waiting for an interrupt), other_cycles (between instructions: 7 per interrupt "
+	"taken, and KERNAL file calls done by the host), unmapped_cycles (65C816 native code outside bank 0) and "
+	"instructions (executed).",
+	"{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+	run_profile_stop,
+	0
+};
+
+typedef struct {
+	uint16_t address;
+	int16_t bank;          // -1 below $A000
+	uint64_t count;
+	uint64_t cycles;
+	const char *sym;       // nearest label (filled when needed), NULL if none
+	uint16_t sym_address;
+} prof_row;
+
+typedef struct {
+	prof_row *rows;
+	size_t n, cap;
+	bool oom;
+} prof_rows;
+
+static void
+prof_collect(void *ctx, uint16_t address, int bank, uint64_t cycles, uint64_t count)
+{
+	prof_rows *r = ctx;
+	if (r->oom) return;
+	if (r->n == r->cap) {
+		size_t cap = r->cap ? r->cap * 2 : 4096;
+		prof_row *nr = realloc(r->rows, cap * sizeof(*nr));
+		if (!nr) {
+			r->oom = true;
+			return;
+		}
+		r->rows = nr;
+		r->cap = cap;
+	}
+	prof_row *row = &r->rows[r->n++];
+	row->address = address;
+	row->bank = (int16_t)bank;
+	row->count = count;
+	row->cycles = cycles;
+	row->sym = NULL;
+	row->sym_address = 0;
+}
+
+// A memory region: -1 below $A000, the RAM bank for $A000-$BFFF, 256 + the ROM bank from $C000 up.
+static int
+prof_region(const prof_row *r)
+{
+	return r->bank < 0 ? -1 : r->address < 0xC000 ? r->bank : 256 + r->bank;
+}
+
+static int
+prof_by_cycles(const void *a, const void *b)
+{
+	const prof_row *x = a, *y = b;
+	if (x->cycles != y->cycles) return x->cycles < y->cycles ? 1 : -1;
+	if (prof_region(x) != prof_region(y)) return prof_region(x) < prof_region(y) ? -1 : 1;
+	return (int)x->address - (int)y->address;
+}
+
+// Groups for the symbol view: rows with the same label (and region) are merged. Ordered by label, then region.
+static int
+prof_by_group(const void *a, const void *b)
+{
+	const prof_row *x = a, *y = b;
+	if (x->sym != y->sym) {
+		if (!x->sym || !y->sym) return x->sym ? -1 : 1;
+		int c = strcmp(x->sym, y->sym);
+		if (c) return c;
+	}
+	return prof_region(x) - prof_region(y);
+}
+
+static void
+prof_append_percent(json_buf *b, uint64_t cycles, uint64_t total)
+{
+	char tmp[64];
+	snprintf(tmp, sizeof(tmp), ",\"percent\":%.2f", total ? 100.0 * (double)cycles / (double)total : 0.0);
+	json_buf_append(b, tmp);
+}
+
+static void
+prof_append_bank(json_buf *b, int bank)
+{
+	char tmp[32];
+	if (bank < 0) {
+		json_buf_append(b, ",\"bank\":null");
+	} else {
+		snprintf(tmp, sizeof(tmp), ",\"bank\":%d", bank);
+		json_buf_append(b, tmp);
+	}
+}
+
+// One entry of the symbol view: a group (row) whose cycles and count are the group's totals.
+static void
+prof_append_group(json_buf *b, const prof_row *g, uint64_t total)
+{
+	char tmp[200];
+	json_buf_append(b, "{\"symbol\":");
+	if (g->sym) {
+		json_buf_append_string(b, g->sym, strlen(g->sym));
+		snprintf(tmp, sizeof(tmp), ",\"address\":\"0x%04X\"", g->sym_address);
+		json_buf_append(b, tmp);
+	} else {
+		int region = prof_region(g);
+		if (region < 0) snprintf(tmp, sizeof(tmp), "null,\"region\":\"low memory\"");
+		else if (region < 256) snprintf(tmp, sizeof(tmp), "null,\"region\":\"RAM bank %d\"", region);
+		else snprintf(tmp, sizeof(tmp), "null,\"region\":\"ROM bank %d\"", region - 256);
+		json_buf_append(b, tmp);
+	}
+	prof_append_bank(b, g->bank);
+	snprintf(tmp, sizeof(tmp), ",\"cycles\":%llu", (unsigned long long)g->cycles);
+	json_buf_append(b, tmp);
+	prof_append_percent(b, g->cycles, total);
+	snprintf(tmp, sizeof(tmp), ",\"instructions\":%llu}", (unsigned long long)g->count);
+	json_buf_append(b, tmp);
+}
+
+// One entry of the address view.
+static void
+prof_append_address(json_buf *b, const prof_row *r, uint64_t total)
+{
+	char tmp[200];
+	snprintf(tmp, sizeof(tmp), "{\"address\":\"0x%04X\"", r->address);
+	json_buf_append(b, tmp);
+	prof_append_bank(b, r->bank);
+	snprintf(tmp, sizeof(tmp), ",\"cycles\":%llu", (unsigned long long)r->cycles);
+	json_buf_append(b, tmp);
+	prof_append_percent(b, r->cycles, total);
+	snprintf(tmp, sizeof(tmp), ",\"count\":%llu", (unsigned long long)r->count);
+	json_buf_append(b, tmp);
+	if (r->sym) {
+		char sym[320];
+		unsigned off = (unsigned)r->address - r->sym_address;
+		if (off) snprintf(sym, sizeof(sym), "%s+0x%X", r->sym, off);
+		else snprintf(sym, sizeof(sym), "%s", r->sym);
+		json_buf_append(b, ",\"symbol\":");
+		json_buf_append_string(b, sym, strlen(sym));
+	}
+	// The instruction as it is in memory now (code changed since it ran shows its new contents)
+	char line[96];
+	int32_t eff;
+	uint8_t bytes[4];
+	int16_t x16bank = r->bank < 0 ? USE_CURRENT_X16_BANK : r->bank;
+	if (disasm_line(r->address, 0, x16bank, line, sizeof(line), &eff, bytes) > 0) {
+		json_buf_append(b, ",\"text\":");
+		json_buf_append_string(b, line, strlen(line));
+	}
+	json_buf_append(b, "}");
+}
+
+static bool
+run_profile_report(mcp_job *job)
+{
+	if (!prof_started) {
+		mcp_job_fail(job, "nothing has been profiled (call profile_start, run some code, then profile_report)");
+		return true;
+	}
+	const json_node *byn = json_get(job->args, "by"), *sn = json_get(job->args, "sort"), *wn = json_get(job->args, "within");
+	const char *by = byn ? json_as_string(byn) : "symbol";
+	if (!by || (strcmp(by, "symbol") && strcmp(by, "address"))) {
+		mcp_job_fail(job, "by must be \"symbol\" or \"address\"");
+		return true;
+	}
+	bool by_symbol = !strcmp(by, "symbol");
+	const char *sort = sn ? json_as_string(sn) : "cycles";
+	if (!sort || (strcmp(sort, "cycles") && strcmp(sort, "address"))) {
+		mcp_job_fail(job, "sort must be \"cycles\" or \"address\"");
+		return true;
+	}
+	if (sn && by_symbol) {
+		mcp_job_fail(job, "sort applies to by \"address\" only (symbols are always ordered by cycles)");
+		return true;
+	}
+	const char *within = NULL;
+	if (wn && (!(within = json_as_string(wn)) || !within[0] || wn->string_len != strlen(within))) {
+		mcp_job_fail(job, "within must be a label name");
+		return true;
+	}
+	uint32_t from = 0, to = 0xFFFF, bank = 0, limit = 50, offset = 0;
+	int sym_bank;
+	if (json_get(job->args, "from") && (!arg_addr(job, "from", &from, &sym_bank) || from > 0xFFFF)) {
+		if (!job->is_error) mcp_job_fail(job, "from must be an address from 0 to 0xFFFF, or a label");
+		return true;
+	}
+	if (json_get(job->args, "to") && (!arg_addr(job, "to", &to, &sym_bank) || to > 0xFFFF)) {
+		if (!job->is_error) mcp_job_fail(job, "to must be an address from 0 to 0xFFFF, or a label");
+		return true;
+	}
+	if (from > to) {
+		mcp_job_fail(job, "from must not be above to");
+		return true;
+	}
+	bool have_bank = json_get(job->args, "bank") != NULL;
+	if (have_bank && (!arg_uint(job, "bank", &bank) || bank > 255)) {
+		mcp_job_fail(job, "bank must be an integer from 0 to 255");
+		return true;
+	}
+	if (json_get(job->args, "limit") && (!arg_uint(job, "limit", &limit) || limit < 1 || limit > 1000)) {
+		mcp_job_fail(job, "limit must be an integer from 1 to 1000");
+		return true;
+	}
+	if (json_get(job->args, "offset") && !arg_uint(job, "offset", &offset)) {
+		mcp_job_fail(job, "offset must be a non-negative integer");
+		return true;
+	}
+	const char *path;
+	bool overwrite;
+	if (!parse_dump_args(job, &path, &overwrite)) {
+		return true;
+	}
+	char resolved[1100];
+	if (path && !host_path(job, path, resolved, sizeof(resolved))) {
+		return true;
+	}
+
+	prof_rows rows = { 0 };
+	profiler_visit(prof_collect, &rows);
+	if (rows.oom) {
+		free(rows.rows);
+		mcp_job_fail(job, "out of memory");
+		return true;
+	}
+	// Name every row and apply the filters
+	size_t n = 0;
+	for (size_t i = 0; i < rows.n; i++) {
+		prof_row r = rows.rows[i];
+		if (r.address < from || r.address > to) continue;
+		if (have_bank && r.address >= 0xA000 && r.bank != (int)bank) continue;
+		mcp_sym_entry e;
+		if (mcp_sym_nearest(r.address, r.bank, &e)) {
+			r.sym = e.name;
+			r.sym_address = e.address;
+		}
+		if (within && (!r.sym || strcmp(r.sym, within))) continue;
+		rows.rows[n++] = r;
+	}
+	// Symbol view: merge each label's rows (per region) into one, keeping the label's address
+	if (by_symbol && n) {
+		qsort(rows.rows, n, sizeof(prof_row), prof_by_group);
+		size_t m = 0;
+		for (size_t i = 0; i < n; i++) {
+			if (m && !prof_by_group(&rows.rows[m - 1], &rows.rows[i])) {
+				rows.rows[m - 1].cycles += rows.rows[i].cycles;
+				rows.rows[m - 1].count += rows.rows[i].count;
+			} else {
+				rows.rows[m++] = rows.rows[i];
+			}
+		}
+		n = m;
+	}
+	if (by_symbol || !strcmp(sort, "cycles")) {
+		qsort(rows.rows, n, sizeof(prof_row), prof_by_cycles);
+	} // else: address order, as visited (low memory, then RAM banks, then ROM banks)
+
+	uint64_t total = prof_window_cycles();
+	size_t first = offset < n ? offset : n;
+	size_t count = path ? n : (n - first < limit ? n - first : limit);
+	if (path) first = 0;
+	json_buf *t = &job->text;
+	char tmp[200];
+	json_buf report;
+	json_buf_init(&report);
+	json_buf *out = path ? &report : t;
+	json_buf_append(out, "{");
+	prof_append_summary(out);
+	snprintf(tmp, sizeof(tmp), ",\"by\":\"%s\",\"entries_total\":%zu,\"offset\":%zu,\"returned\":%zu,\"entries\":[", by,
+	         n, first, count);
+	json_buf_append(out, tmp);
+	for (size_t i = 0; i < count; i++) {
+		if (i) json_buf_append(out, ",");
+		if (by_symbol) prof_append_group(out, &rows.rows[first + i], total);
+		else prof_append_address(out, &rows.rows[first + i], total);
+	}
+	json_buf_append(out, "]}");
+	free(rows.rows);
+	if (path) {
+		bool ok = dump_to_file(job, resolved, (const uint8_t *)report.data, report.len, overwrite);
+		size_t bytes = report.len;
+		json_buf_free(&report);
+		if (!ok) {
+			return true;
+		}
+		json_buf_append(t, "{");
+		prof_append_summary(t);
+		snprintf(tmp, sizeof(tmp), ",\"by\":\"%s\",\"entries_total\":%zu,\"bytes\":%zu,\"path\":", by, n, bytes);
+		json_buf_append(t, tmp);
+		json_buf_append_string(t, resolved, strlen(resolved));
+		json_buf_append(t, "}");
+	}
+	return true;
+}
+
+static const mcp_tool tool_profile_report = {
+	"profile_report",
+	"Reports what the profiler counted (see profile_start). The totals come first (as in profile_stop), then "
+	"`entries`, by cycles, highest first. by \"symbol\" (default) adds up each label's addresses: the nearest label "
+	"at or below each address, as in `symbol` elsewhere, so load the program's labels first (load_symbols); "
+	"addresses with no label are grouped per memory region (`region`). Entries give symbol, address, bank, cycles, "
+	"percent (of the profiled cycles) and instructions (executed). Inner labels split a routine, so read the names. "
+	"by \"address\" lists single instructions: address, bank, cycles, percent, count (times executed), symbol "
+	"(name+0xN) and text (the instruction as it is in memory now); sort \"address\" lists them in address order, to "
+	"read a routine with its costs. Filters: from/to (inclusive addresses or labels), bank (for $A000 up), within (a "
+	"label: only addresses that belong to it). Paged by limit (default 50, max 1000) and offset. With path the "
+	"whole report (every entry) is written to that host file as JSON, inside the host path root, and only the totals "
+	"are returned; an existing file is replaced only with overwrite.",
+	"{\"type\":\"object\",\"properties\":{"
+		"\"by\":{\"type\":\"string\",\"enum\":[\"symbol\",\"address\"],\"default\":\"symbol\"},"
+		"\"sort\":{\"type\":\"string\",\"enum\":[\"cycles\",\"address\"],\"default\":\"cycles\"},"
+		"\"from\":{\"type\":[\"integer\",\"string\"]},\"to\":{\"type\":[\"integer\",\"string\"]},"
+		"\"bank\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255},"
+		"\"within\":{\"type\":\"string\"},"
+		"\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000,\"default\":50},"
+		"\"offset\":{\"type\":\"integer\",\"minimum\":0,\"default\":0},"
+		"\"path\":{\"type\":\"string\"},\"overwrite\":{\"type\":\"boolean\",\"default\":false}},"
+	 "\"additionalProperties\":false}",
+	run_profile_report,
+	0
+};
+
+#endif // PROFILER
+
 // ---- debug_stall (only registered when X16EMU_MCP_TEST is set) ----
 // Takes `ms` milliseconds to complete while the emulator keeps running; used to
 // test that polled jobs do not block the emulator and that timeouts work.
@@ -2444,6 +2883,11 @@ mcp_tool_table(void)
 		table[n++] = &tool_mouse_move;
 		table[n++] = &tool_mouse_button;
 		table[n++] = &tool_mouse_wheel;
+#ifdef PROFILER
+		table[n++] = &tool_profile_start;
+		table[n++] = &tool_profile_stop;
+		table[n++] = &tool_profile_report;
+#endif
 		if (getenv("X16EMU_MCP_TEST")) {
 			table[n++] = &tool_debug_stall;
 		}

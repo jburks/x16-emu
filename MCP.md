@@ -21,7 +21,8 @@ the WebAssembly build). Build without it with `cmake -DENABLE_MCP=OFF`: the
 emulator then contains none of the MCP code, its hooks in the CPU memory access
 and VERA write paths compile to nothing, and `-mcp` exits with a message saying
 the server is not built in. The CMake build summary shows the setting as
-`MCP Server`.
+`MCP Server`. The profiler (see "Profile") is a second option, `ENABLE_PROFILER`
+(on by default), built only together with the server.
 
 ## Attaching an agent
 
@@ -475,6 +476,75 @@ Once symbols are loaded:
 - Only the **ca65/ld65 label format** is read. Debug-info (`.dbg`) and map files
   are not.
 
+### Profile
+
+Find out where the CPU's time goes. While the profiler runs, every instruction
+the CPU executes adds its cycles, and one execution, to a counter for its
+address (and its bank, from `$A000` up). Every instruction is counted and the
+cycles are emulated ones, so the profile is exact and the same code gives the
+same profile every time.
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `profile_start` | `reset` | Starts counting. `reset` (default `true`) clears earlier counts; `false` adds to them. |
+| `profile_stop` | none | Stops counting and returns the totals. The counts are kept until the next `profile_start` with `reset`. |
+| `profile_report` | `by`, `sort`, `from`, `to`, `bank`, `within`, `limit`, `offset`, `path`, `overwrite` | The totals and the counted entries, highest cycles first. `by: "symbol"` (default) adds up the addresses of each label; `by: "address"` lists single instructions. |
+
+Every result starts with the totals:
+
+- `cycles`: the profiled window, exactly the cycles that passed while the
+  profiler ran (the sum of all segments since the last reset).
+- `instruction_cycles`: cycles spent executing instructions. The entries add up
+  to this.
+- `wait_cycles`: cycles the CPU spent in `WAI` waiting for an interrupt (not
+  charged to any address).
+- `other_cycles`: cycles that pass between instructions: 7 for every interrupt
+  the CPU takes, and the time of KERNAL file calls that the emulator does on
+  the host.
+- `unmapped_cycles`: instructions outside bank 0 in 65C816 native mode, which
+  have no counter.
+- `instructions`: instructions executed; `profiling`: whether it is running.
+
+`instruction_cycles + wait_cycles + other_cycles + unmapped_cycles = cycles`.
+
+Entries of `by: "symbol"` give `symbol`, `address` (the label's), `bank`,
+`cycles`, `percent` (of `cycles`) and `instructions` (executions). Each address
+belongs to the nearest label at or below it, as for `symbol` elsewhere, so load
+the program's labels with `load_symbols` first. Addresses without a label are
+grouped per memory region (`symbol: null`, `region`: `low memory`, `RAM bank 2`,
+`ROM bank 0`, ...). Inner labels (`@loop`, or a plain label inside a routine)
+start a group of their own, so a routine with inner labels shows up in parts.
+
+Entries of `by: "address"` give `address`, `bank`, `cycles`, `percent`, `count`
+(times executed), `symbol` (`name+0xN`) and `text` (the instruction as it is in
+memory now). With `sort: "address"` they come in address order, to read a
+routine with the cost of each instruction.
+
+Filters: `from` and `to` (an inclusive range; numbers or labels), `bank` (for
+addresses from `$A000` up), and `within` (a label: only the addresses that
+belong to it). The report is paged by `limit` (default 50, at most 1000) and
+`offset`, and `entries_total` says how many there are. With `path` the whole
+report, every entry, is written to that host file as JSON (inside the host path
+root; an existing file is replaced only with `overwrite: true`), and only the
+totals come back.
+
+Tips:
+
+- **Profile exactly the stretch you care about.** Tool calls take no emulated
+  time, so `profile_start` while paused at a breakpoint and `profile_stop` at the
+  next one profiles exactly the code between them; `profile_start` then
+  `run_frames` profiles whole frames.
+- **Several runs:** `profile_start` with `reset: false` adds another segment to
+  the same counts.
+- **Find the hot instructions inside a routine:** `profile_report` with
+  `by: "address"`, `within: "draw_line"` and `sort: "address"`.
+- Profiling makes the emulator a little slower; stop it when you are done.
+  `get_status` shows `profiling`.
+- The profile counts cycles per address only. It does not know which routine
+  called which, so the time of a routine's callees is not added to it, and a
+  routine reached with `JMP` (instead of `JSR`) is reported under its own label
+  like any other code.
+
 ### Mouse
 
 | Tool | Arguments | What it does |
@@ -582,6 +652,7 @@ has the helpers (`Emu`, `check`, `wait_screen`, ...).
 | `src/mcp_hash.c` | SHA-256 for `hash_memory` (CRC32 comes from zlib) |
 | `src/mcp_paths.c` | The host path policy: root, restriction, `..` handling |
 | `src/mcp_symbols.c` | Label files, name lookup and naming addresses |
+| `src/profiler.c`, `src/profiler.h` | The profiler: cycles and counts per instruction address. Not MCP code; the MCP tools are its front end. Without `PROFILER` the header has empty stubs. |
 
 A thread reads and parses requests; each `tools/call` becomes a job that the
 **emulator thread** runs at the top of `emulator_loop`, so tools can touch

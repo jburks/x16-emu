@@ -42,6 +42,7 @@
 #include "wav_recorder.h"
 #include "testbench.h"
 #include "mcp.h"
+#include "profiler.h"
 #include "cartridge.h"
 #include "midi.h"
 #include "git_rev.h"
@@ -1755,7 +1756,11 @@ emulator_loop(void *param)
 
 		instruction_counter += waiting ^ 0x1;
 
-		step6502();
+		if (profiler_on()) {
+			profiler_step(); // step6502(), counting the instruction's cycles at its address
+		} else {
+			step6502();
+		}
 		uint32_t clocks = clockticks6502 - old_clockticks6502;
 		old_clockticks6502 = clockticks6502;
 		bool new_frame = false;

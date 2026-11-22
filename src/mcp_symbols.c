@@ -246,29 +246,50 @@ is_linker_symbol(const char *n)
 	return l > 4 && n[0] == '_' && n[1] == '_' && n[l - 1] == '_' && n[l - 2] == '_';
 }
 
-bool
-mcp_sym_describe(uint16_t address, char *out, size_t out_size)
+// The nearest label at or below address (see mcp_sym_describe), looking from $A000 up only at labels for `bank`
+// (or without a bank). NULL if there is none.
+static const symbol_t *
+nearest(uint16_t address, int bank)
 {
-	if (!count) return false;
+	if (!count) return NULL;
 	// the last entry with address <= target
 	size_t lo = 0, hi = count;
 	while (lo < hi) {
 		size_t mid = (lo + hi) / 2;
 		if (by_addr[mid]->address <= address) lo = mid + 1; else hi = mid;
 	}
-	int cur_bank = address < 0xA000 ? -1 : address < 0xC000 ? memory_get_ram_bank() : memory_get_rom_bank();
 	for (size_t i = lo, tries = 0; i > 0 && tries < 4096; i--, tries++) {
 		const symbol_t *s = by_addr[i - 1];
 		if ((unsigned)address - s->address > MAX_DESCRIBE_OFFSET) break;
 		if ((s->address < 0xA000) != (address < 0xA000)) continue;
-		if (address >= 0xA000 && s->bank >= 0 && s->bank != cur_bank) continue;
+		if (address >= 0xA000 && s->bank >= 0 && s->bank != bank) continue;
 		if (is_linker_symbol(s->name)) continue;
-		unsigned off = (unsigned)address - s->address;
-		if (off) snprintf(out, out_size, "%s+0x%X", s->name, off);
-		else snprintf(out, out_size, "%s", s->name);
-		return true;
+		return s;
 	}
-	return false;
+	return NULL;
+}
+
+bool
+mcp_sym_describe(uint16_t address, char *out, size_t out_size)
+{
+	int cur_bank = address < 0xA000 ? -1 : address < 0xC000 ? memory_get_ram_bank() : memory_get_rom_bank();
+	const symbol_t *s = nearest(address, cur_bank);
+	if (!s) return false;
+	unsigned off = (unsigned)address - s->address;
+	if (off) snprintf(out, out_size, "%s+0x%X", s->name, off);
+	else snprintf(out, out_size, "%s", s->name);
+	return true;
+}
+
+bool
+mcp_sym_nearest(uint16_t address, int bank, mcp_sym_entry *out)
+{
+	const symbol_t *s = nearest(address, bank);
+	if (!s) return false;
+	out->name = s->name;
+	out->address = s->address;
+	out->bank = s->bank;
+	return true;
 }
 
 size_t

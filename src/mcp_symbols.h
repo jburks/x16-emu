@@ -33,6 +33,10 @@ typedef struct {
 	int bank;          // -1: none
 } mcp_sym_entry;
 
+// The label mcp_sym_describe would use, but for an explicit bank instead of the current one: from $A000 up,
+// only labels for `bank` (or without a bank) are considered. Returns false if there is none.
+bool mcp_sym_nearest(uint16_t address, int bank, mcp_sym_entry *out);
+
 // Lists symbols for the list_symbols tool. A symbol matches if its name starts with prefix (if not NULL) and
 // contains `contains` (if not NULL); both are case-sensitive. Linker symbols (names that start and end with
 // "__") are left out unless include_linker. Matches are ordered by name, or by address (then name) with

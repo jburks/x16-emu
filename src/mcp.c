@@ -433,8 +433,12 @@ handle_initialize(const char *id_json, const json_node *params)
 		"accept timeout_ms and leave the emulator paused if it expires. Addresses may be integers or "
 		"strings such as \"$9F20\". The emulator boots to BASIC in about 3-5 s: wait for READY. "
 		"(text layer at VRAM $1B000, 256 bytes per row, character at every other byte) before typing. "
-		"Start with -zeroram for bit-identical runs. Host files (load_prg, and the path argument of read_memory and "
-		"get_screen) are limited to one folder: get_status shows it as host_root, and relative paths are relative to it. "
+		"Start with -zeroram for bit-identical runs. "
+#ifdef PROFILER
+		"To find where the cycles go, use profile_start, profile_stop and profile_report (exact cycles per "
+		"instruction address; load_symbols first to see them per routine). "
+#endif
+		"Host files (load_prg, load_symbols, and the path arguments of read_memory, get_screen and profile_report) are limited to one folder: get_status shows it as host_root, and relative paths are relative to it. "
 		"Full documentation: MCP.md in the emulator repository.";
 	json_buf_append_string(&b, instructions, sizeof(instructions) - 1);
 	json_buf_append(&b, "}");
