@@ -23,6 +23,16 @@ typedef struct {
 	uint32_t size;
 } scope_range_t;
 
+// An address range that one source line produced, from debug info.
+typedef struct {
+	uint32_t start;   // with the bank in bits 16-23, as for scopes
+	uint32_t size;
+	uint32_t file;    // index into files
+	uint32_t line;
+	uint16_t count;   // nesting depth in macro (or .repeat) expansions: 0 = the line as written where the code is
+	bool c_source;    // a C source line (type=1): cc65's compiled code also has lines of the generated .s file
+} line_range_t;
+
 #define MAX_SYMBOLS 200000
 #define MAX_FILE (32u * 1024 * 1024)
 #define MAX_DESCRIBE_OFFSET 0x1000
@@ -35,8 +45,20 @@ static symbol_t **by_short; // sorted by short name
 static symbol_t **by_addr;  // sorted by address, then bank
 static scope_range_t *scopes;
 static size_t scope_count;
+static char **files;          // source file names, as the debug info gives them
+static size_t file_count;
+static line_range_t *lines;   // sorted by the address part of start
+static size_t line_count;
+static uint32_t *line_reach;  // line_reach[i]: the highest end (address part) of lines[0..i]
 
 // ---- growable arrays used while a file is read ----
+
+typedef struct {
+	line_range_t *v;
+	size_t n, cap;
+	char **files; // by file id; NULL where the id has no file record
+	size_t nfiles;
+} linevec;
 
 typedef struct {
 	symbol_t *v;
@@ -130,9 +152,12 @@ free_all(void)
 		free(symbols[i].name);
 	}
 	for (size_t i = 0; i < scope_count; i++) free(scopes[i].path);
+	for (size_t i = 0; i < file_count; i++) free(files[i]);
 	free(symbols); free(by_name); free(by_short); free(by_addr); free(scopes);
+	free(files); free(lines); free(line_reach);
 	symbols = NULL; by_name = by_short = by_addr = NULL; scopes = NULL;
-	count = scope_count = 0;
+	files = NULL; lines = NULL; line_reach = NULL;
+	count = scope_count = file_count = line_count = 0;
 }
 
 // ---- indexes ----
@@ -177,6 +202,21 @@ cmp_scope(const void *a, const void *b)
 	const scope_range_t *x = a, *y = b;
 	if (x->start != y->start) return x->start < y->start ? -1 : 1;
 	return x->size > y->size ? -1 : x->size < y->size ? 1 : 0;
+}
+
+// By address, then by everything else, so that identical ranges (the same file loaded twice) are adjacent.
+static int
+cmp_line(const void *a, const void *b)
+{
+	const line_range_t *x = a, *y = b;
+	if ((x->start & 0xFFFF) != (y->start & 0xFFFF)) return (x->start & 0xFFFF) < (y->start & 0xFFFF) ? -1 : 1;
+	if (x->start != y->start) return x->start < y->start ? -1 : 1;
+	if (x->size != y->size) return x->size < y->size ? -1 : 1;
+	if (x->line != y->line) return x->line < y->line ? -1 : 1;
+	if (x->count != y->count) return x->count < y->count ? -1 : 1;
+	if (x->c_source != y->c_source) return x->c_source ? 1 : -1;
+	const char *fx = files[x->file] ? files[x->file] : "", *fy = files[y->file] ? files[y->file] : "";
+	return strcmp(fx, fy);
 }
 
 static bool
@@ -255,6 +295,60 @@ rebuild_indexes(void)
 		i = j;
 	}
 	return merged;
+}
+
+static void
+free_linevec(linevec *lv)
+{
+	for (size_t i = 0; i < lv->nfiles; i++) free(lv->files[i]);
+	free(lv->files);
+	free(lv->v);
+	memset(lv, 0, sizeof(*lv));
+}
+
+// Adds the read source lines and their file names (taking them over), then sorts the lines and indexes their reach.
+static void
+commit_lines(linevec *lv)
+{
+	if (lv->n) {
+		char **nf = realloc(files, (file_count + lv->nfiles) * sizeof(*nf));
+		line_range_t *nl = nf ? realloc(lines, (line_count + lv->n) * sizeof(*nl)) : NULL;
+		if (nf) files = nf;
+		if (nl) {
+			lines = nl;
+			for (size_t i = 0; i < lv->n; i++) {
+				lv->v[i].file += (uint32_t)file_count;
+				lines[line_count++] = lv->v[i];
+			}
+			for (size_t i = 0; i < lv->nfiles; i++) {
+				files[file_count++] = lv->files[i];
+				lv->files[i] = NULL;
+			}
+		}
+	}
+	free_linevec(lv);
+	free(line_reach);
+	line_reach = NULL;
+	if (!line_count) return;
+	qsort(lines, line_count, sizeof(*lines), cmp_line);
+	size_t n = 0;
+	for (size_t i = 0; i < line_count; i++) { // the same range twice (debug info loaded again) is kept once
+		if (!n || cmp_line(&lines[n - 1], &lines[i])) lines[n++] = lines[i];
+	}
+	line_count = n;
+	line_reach = malloc(line_count * sizeof(*line_reach));
+	if (!line_reach) { // without the index, lookups find nothing
+		free(lines);
+		lines = NULL;
+		line_count = 0;
+		return;
+	}
+	uint32_t reach = 0;
+	for (size_t i = 0; i < line_count; i++) {
+		uint32_t end = (lines[i].start & 0xFFFF) + lines[i].size;
+		if (end > reach) reach = end;
+		line_reach[i] = reach;
+	}
 }
 
 // Adds the read labels and scopes (taking them over), after dropping the old ones with replace.
@@ -468,6 +562,12 @@ scope_path(dbg_scope *sc, size_t nsc, long id, int depth)
 }
 
 typedef struct {
+	long file, line, count;
+	bool c_source;
+	char *spans; // "3+4+5", or NULL
+} dbg_line;
+
+typedef struct {
 	char *name;
 	long scope;
 	uint32_t value;
@@ -480,13 +580,15 @@ typedef struct {
 } dbg_sym;
 
 static bool
-parse_dbg(symvec *sv, scopevec *cv, const char *text, size_t n, size_t *added, size_t *skipped, char *err, size_t err_size)
+parse_dbg(symvec *sv, scopevec *cv, linevec *lv, const char *text, size_t n, size_t *added, size_t *skipped,
+          char *err, size_t err_size)
 {
 	dbg_scope *sc = NULL;
 	dbg_span *sp = NULL;
 	long *seg = NULL;
 	dbg_sym *sy = NULL;
-	size_t nsc = 0, nsp = 0, nseg = 0, nsy = 0;
+	dbg_line *ln = NULL;
+	size_t nsc = 0, nsp = 0, nseg = 0, nsy = 0, nln = 0;
 	bool ok = true;
 	*added = *skipped = 0;
 	for (size_t i = 0; i < n && ok;) {
@@ -529,6 +631,18 @@ parse_dbg(symvec *sv, scopevec *cv, const char *text, size_t n, size_t *added, s
 			sy[id].value = (uint32_t)field_num(&f, "val", 0);
 			sy[id].scope = field_num(&f, "scope", -1);
 			if (field(&f, "name", &v, &vl) && vl) sy[id].name = dup_n(v, vl);
+		} else if (tl == 4 && !memcmp(line, "file", 4)) {
+			if (!(ok = grow_to((void **)&lv->files, &lv->nfiles, id, sizeof(*lv->files)))) break;
+			if (field(&f, "name", &v, &vl) && vl && !lv->files[id]) lv->files[id] = dup_n(v, vl);
+		} else if (tl == 4 && !memcmp(line, "line", 4)) {
+			if (!field(&f, "span", &v, &vl) || !vl) continue; // a line that produced no bytes
+			if (!(ok = grow_to((void **)&ln, &nln, id, sizeof(*ln)))) break;
+			ln[id].file = field_num(&f, "file", -1);
+			ln[id].line = field_num(&f, "line", 0);
+			ln[id].count = field_num(&f, "count", 0);
+			ln[id].c_source = field_num(&f, "type", 0) == 1;
+			free(ln[id].spans);
+			ln[id].spans = dup_n(v, vl);
 		}
 	}
 	if (!ok) {
@@ -580,6 +694,40 @@ parse_dbg(symvec *sv, scopevec *cv, const char *text, size_t n, size_t *added, s
 			}
 		}
 	}
+	// Address ranges of source lines
+	for (size_t i = 0; ok && i < nln; i++) {
+		dbg_line *l = &ln[i];
+		if (!l->spans || l->file < 0 || (size_t)l->file >= lv->nfiles || !lv->files[l->file] || l->line <= 0 ||
+		    l->count < 0 || l->count > 0xFFFF) {
+			continue;
+		}
+		for (const char *p = l->spans; *p;) {
+			char *e;
+			long s = strtol(p, &e, 10);
+			if (e == p) break;
+			p = *e == '+' ? e + 1 : e;
+			if (s < 0 || (size_t)s >= nsp || sp[s].size <= 0 || sp[s].seg < 0 || (size_t)sp[s].seg >= nseg) continue;
+			if (lv->n == lv->cap) {
+				size_t nc = lv->cap ? lv->cap * 2 : 1024;
+				line_range_t *nv = realloc(lv->v, nc * sizeof(*nv));
+				if (!nv) {
+					ok = false;
+					break;
+				}
+				lv->v = nv;
+				lv->cap = nc;
+			}
+			line_range_t *r = &lv->v[lv->n++];
+			r->start = (uint32_t)(seg[sp[s].seg] + sp[s].start);
+			r->size = (uint32_t)sp[s].size;
+			r->file = (uint32_t)l->file;
+			r->line = (uint32_t)l->line;
+			r->count = (uint16_t)l->count;
+			r->c_source = l->c_source;
+		}
+	}
+	for (size_t i = 0; i < nln; i++) free(ln[i].spans);
+	free(ln);
 	for (size_t i = 0; i < nsc; i++) {
 		free(sc[i].name);
 		free(sc[i].spans);
@@ -615,6 +763,7 @@ mcp_sym_load(const char *path, bool replace, mcp_sym_load_info *info, char *err,
 	text[n] = 0;
 	symvec sv = { 0 };
 	scopevec cv = { 0 };
+	linevec lv = { 0 };
 	size_t ok;
 	if (!strncmp(text, "version\tmajor=", 14)) {
 		info->debug_info = true;
@@ -623,14 +772,16 @@ mcp_sym_load(const char *path, bool replace, mcp_sym_load_info *info, char *err,
 			snprintf(err, err_size, "%.400s: unsupported cc65 debug info version (major 2 is read)", path);
 			return false;
 		}
-		bool good = parse_dbg(&sv, &cv, text, n, &ok, &info->skipped, err, err_size);
+		bool good = parse_dbg(&sv, &cv, &lv, text, n, &ok, &info->skipped, err, err_size);
 		free(text);
 		if (!good) {
 			discard(&sv, &cv);
+			free_linevec(&lv);
 			return false;
 		}
 		if (ok == 0) {
 			discard(&sv, &cv);
+			free_linevec(&lv);
 			snprintf(err, err_size, "no labels found in the debug info %.400s", path);
 			return false;
 		}
@@ -647,6 +798,7 @@ mcp_sym_load(const char *path, bool replace, mcp_sym_load_info *info, char *err,
 	info->added = ok;
 	info->scopes = cv.n;
 	info->merged = commit(&sv, &cv, replace);
+	commit_lines(&lv);
 	return true;
 }
 
@@ -816,7 +968,7 @@ nearest(uint16_t address, int bank)
 bool
 mcp_sym_describe(uint16_t address, char *out, size_t out_size)
 {
-	int cur_bank = address < 0xA000 ? -1 : address < 0xC000 ? memory_get_ram_bank() : memory_get_rom_bank();
+	int cur_bank = mcp_sym_current_bank(address);
 	const symbol_t *s = nearest(address, cur_bank);
 	if (!s) return false;
 	unsigned off = (unsigned)address - s->address;
@@ -900,4 +1052,53 @@ mcp_sym_in_scope(uint16_t address, int bank, const char *path)
 		}
 	}
 	return false;
+}
+
+size_t mcp_sym_line_count(void) { return line_count; }
+
+int
+mcp_sym_current_bank(uint16_t address)
+{
+	return address < 0xA000 ? -1 : address < 0xC000 ? memory_get_ram_bank() : memory_get_rom_bank();
+}
+
+bool
+mcp_sym_source_at(uint16_t address, int bank, mcp_sym_source *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!line_count) return false;
+	// the last range starting at or below address; earlier ones count only while their reach goes past it
+	size_t lo = 0, hi = line_count;
+	while (lo < hi) {
+		size_t mid = (lo + hi) / 2;
+		if ((lines[mid].start & 0xFFFF) <= address) lo = mid + 1; else hi = mid;
+	}
+	const line_range_t *c = NULL, *outer = NULL, *body = NULL;
+	for (size_t i = lo; i > 0 && line_reach[i - 1] > address; i--) {
+		const line_range_t *r = &lines[i - 1];
+		if ((uint32_t)address - (r->start & 0xFFFF) >= r->size) continue;
+		if (r->start > 0xFFFF && (address < 0xA000 || (int)(r->start >> 16) != bank)) continue;
+		if (!files[r->file]) continue;
+		// the smallest range of each kind; for expansion bodies the deepest
+		if (r->c_source) {
+			if (!c || r->size < c->size) c = r;
+		} else if (r->count == 0) {
+			if (!outer || r->size < outer->size) outer = r;
+		} else if (!body || r->count > body->count || (r->count == body->count && r->size < body->size)) {
+			body = r;
+		}
+	}
+	const line_range_t *at = c ? c : outer;
+	if (!at) { // only expansion bodies (not expected from ld65): report the body as the position
+		at = body;
+		body = NULL;
+	}
+	if (!at) return false;
+	out->file = files[at->file];
+	out->line = at->line;
+	if (body) {
+		out->macro_file = files[body->file];
+		out->macro_line = body->line;
+	}
+	return true;
 }

@@ -1,6 +1,7 @@
 """cc65 debug info (ld65 --dbgfile): scope-path names in every result, scope paths and name@$XXXX as inputs,
 ambiguous names, merging with the label file, and the label file alone. Uses tests/mcp/fixtures/scoped
-(two modules; rebuild with its build.sh)."""
+(four modules: two with scopes, one with macros and .repeat, one in C; rebuild with its build.sh). Also the
+source positions (file/line, macro_file/macro_line) in results."""
 import json, os, shutil, sys, tempfile
 from mcp_testlib import *
 
@@ -11,6 +12,10 @@ for f in ("scoped.dbg", "scoped.sym", "scoped.bin"):
 # Addresses in the fixture (see a.s, b.s and scoped.sym)
 START, DONE_A, PROCA, PROCA_LOOP, OUTER, INNER, INNER_LOOP, PROCB, PROCB_LOOP, DONE_B, TABLE = \
     0x400, 0x409, 0x40C, 0x40E, 0x412, 0x416, 0x418, 0x41C, 0x420, 0x424, 0x425
+# c.s (macros at $428): the nested macro's four instructions, the single macro's clc, the .repeat's three inx
+NESTED, ADD2_CLC, REPEAT = (0x42A, 0x42B, 0x42D, 0x42E), 0x430, 0x433
+# d.c (_count3 at $437): an instruction of each C line, 6, 7, 8 (two) and 9
+C_LINES = (0x437, 0x43A, 0x43D, 0x43F, 0x446)
 
 e = Emu(["-zeroram"], env={"X16EMU_MCP_ROOT": tmp})
 check("boots to READY.", wait_screen(e, "READY."))
@@ -25,9 +30,9 @@ def addr_of(name):
 # ---- loading the debug info ----
 r = e.ok("load_symbols", {"path": "scoped.dbg"})
 check("debug info detected by content", r["format"] == "debug_info", r)
-check("labels, the address constant and the imported constant are loaded", r["loaded"] == 13 and r["total"] == 13, r)
+check("labels, the address constant and the imported constant are loaded", r["loaded"] == 16 and r["total"] == 16, r)
 check("plain constants and import records are skipped", r["skipped_symbols"] == 3, r)
-check("one address range per named scope (procA, outer, inner, procB)", r["scopes"] == 4 and r["merged"] == 0, r)
+check("one address range per named scope (procA, outer, inner, procB, macros, _count3)", r["scopes"] == 6 and r["merged"] == 0, r)
 
 # ---- names: scope paths ----
 check("a label in a .proc is named proc::label", name_of(PROCA_LOOP) == "procA::loop", name_of(PROCA_LOOP))
@@ -121,14 +126,52 @@ check("within a label that is not a scope: that label's addresses", [x["address"
 err, t = e.call("profile_report", {"scope_level": "outermost"}); check("scope_level needs by scope", err and "scope_level" in t, t)
 err, t = e.call("profile_report", {"by": "scope", "scope_level": "x"}); check("scope_level must be innermost or outermost", err and "scope_level" in t, t)
 
+# ---- source positions ----
+def src(addr):
+    r = e.ok("lookup_symbol", {"address": addr})
+    return (r.get("file"), r.get("line"), r.get("macro_file"), r.get("macro_line"))
+check("load_symbols counts the source lines", e.ok("load_symbols", {"path": "scoped.dbg"})["source_lines"] == 49)
+check("plain code: file and line, no macro fields", src(PROCA_LOOP) == ("a.s", 16, None, None) and src(PROCB_LOOP) == ("b.s", 9, None, None),
+      (src(PROCA_LOOP), src(PROCB_LOOP)))
+check("data: the line that defines it", src(TABLE + 2) == ("b.s", 14, None, None), src(TABLE + 2))
+check("a macro: the call site, and the line in the macro body", src(ADD2_CLC) == ("c.s", 18, "c.s", 5) and src(ADD2_CLC + 1) == ("c.s", 18, "c.s", 6),
+      (src(ADD2_CLC), src(ADD2_CLC + 1)))
+check("nested macros: the outermost call site and the innermost body line",
+      [src(a) for a in NESTED] == [("c.s", 17, "c.s", 5), ("c.s", 17, "c.s", 6), ("c.s", 17, "c.s", 5), ("c.s", 17, "c.s", 6)], [src(a) for a in NESTED])
+check(".repeat: the .endrepeat line (as ca65 records it) and the body line", [src(REPEAT + i) for i in range(3)] == [("c.s", 21, "c.s", 20)] * 3,
+      [src(REPEAT + i) for i in range(3)])
+check("after the macros: plain again", src(REPEAT + 3) == ("c.s", 22, None, None), src(REPEAT + 3))
+check("C compiled by cc65: the C source line, not the generated .s line",
+      [src(a)[:2] for a in C_LINES] == [("d.c", 6), ("d.c", 7), ("d.c", 8), ("d.c", 8), ("d.c", 9)], [src(a) for a in C_LINES])
+r = e.ok("lookup_symbol", {"address": 0x500})
+check("an address no line covers has no file", "file" not in r and "line" not in r, r)
+r = e.ok("lookup_symbol", {"name": "macros"})
+check("lookup_symbol by name gives the source position too", r.get("file") == "c.s" and r.get("line") == 16, r)
+pa = e.ok("profile_report", {"by": "address", "within": "procB::loop", "sort": "address"})
+check("profile_report by address gives file and line", [(x.get("file"), x.get("line")) for x in pa["entries"]] == [("b.s", 9), ("b.s", 10), ("b.s", 11)], pa["entries"])
+e.ok("set_breakpoint", {"address": NESTED[1]})
+e.ok("set_registers", {"pc": "macros", "status": 0x24})
+r = e.ok("continue", {"wait": True})
+check("a stop result gives the source position", (r.get("file"), r.get("line"), r.get("macro_file"), r.get("macro_line")) == ("c.s", 17, "c.s", 6), r)
+g = e.ok("get_registers")
+check("get_registers too", (g.get("file"), g.get("line"), g.get("macro_line")) == ("c.s", 17, 6), g)
+e.ok("clear_breakpoint", {"all": True})
+e.ok("set_watchpoint", {"address": "_counter", "access": "write"})
+e.ok("set_registers", {"pc": "_count3", "status": 0x24})
+r = e.ok("continue", {"wait": True})
+check("a watchpoint stop gives the accessing instruction's position too",
+      r.get("stopped") == "watchpoint" and (r.get("accessing_pc_file"), r.get("accessing_pc_line")) == ("d.c", 6)
+      and (r.get("file"), r.get("line")) == ("d.c", 7), r)
+e.ok("clear_watchpoint", {"all": True})
+
 # ---- the label file on top: merged, scoped names kept ----
 r = e.ok("load_symbols", {"path": "scoped.sym"})
-check("the label file (14 lines, procA and procB twice) merges into the debug info", r["format"] == "labels" and r["loaded"] == 14 and r["merged"] == 14 and r["total"] == 13, r)
+check("the label file (20 lines, five labels twice) merges into the debug info", r["format"] == "labels" and r["loaded"] == 20 and r["merged"] == 20 and r["total"] == 16, r)
 check("scoped names survive", name_of(PROCA_LOOP) == "procA::loop" and name_of(INNER_LOOP) == "outer::inner::loop")
 
 # ---- the label file alone ----
 r = e.ok("load_symbols", {"path": "scoped.sym", "replace": True})
-check("replace with the label file: its repeated labels are kept once", r["total"] == 12 and r["scopes"] == 0 and r["merged"] == 2, r)
+check("replace with the label file: its repeated labels are kept once", r["total"] == 15 and r["scopes"] == 0 and r["merged"] == 5 and r["source_lines"] == 0, r)
 check("without scopes, a shared name is shown with its address", name_of(PROCA_LOOP) == "loop@$%04X" % PROCA_LOOP, name_of(PROCA_LOOP))
 err, t = e.call("lookup_symbol", {"name": "loop"}); check("and is ambiguous as input", err and "loop@$%04X" % PROCB_LOOP in t, t)
 check("name@$XXXX works for the label file", addr_of("loop@$%04X" % INNER_LOOP) == INNER_LOOP)
@@ -141,9 +184,9 @@ open(os.path.join(tmp, "v3.dbg"), "w").write("version\tmajor=3,minor=0\nsym\tid=
 err, t = e.call("load_symbols", {"path": "v3.dbg"}); check("an unsupported debug info version is refused", err and "version" in t, t)
 open(os.path.join(tmp, "empty.dbg"), "w").write("version\tmajor=2,minor=0\ninfo\tcsym=0\n")
 err, t = e.call("load_symbols", {"path": "empty.dbg"}); check("debug info without labels is refused", err and "no labels" in t, t)
-check("a refused file leaves the symbols as they were", e.ok("list_symbols")["loaded"] == 12)
+check("a refused file leaves the symbols as they were", e.ok("list_symbols")["loaded"] == 15)
 r = e.ok("load_symbols", {"path": "scoped.dbg", "replace": True})
-check("replace with debug info", r["total"] == 13 and r["scopes"] == 4, r)
+check("replace with debug info", r["total"] == 16 and r["scopes"] == 6, r)
 
 e.close()
 finish()

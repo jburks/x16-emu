@@ -445,8 +445,8 @@ Load the labels of the program under test and use names instead of addresses.
 
 | Tool | Arguments | What it does |
 |---|---|---|
-| `load_symbols` | `path`\*, `replace` | Loads labels from a ca65/ld65 label file (`ld65 -Ln file.sym`: VICE-format lines such as `al 000801 .main`; other lines are skipped and counted) or from cc65 debug info (`ld65 --dbgfile file.dbg`), told apart by content. Labels are added to those already loaded unless `replace: true`; a file with no labels changes nothing. Returns `format` (`labels` or `debug_info`), `loaded`, `merged`, `scopes` and `total`. The path must lie inside the host path root. |
-| `lookup_symbol` | `name` or `address` | `name` (`main`, `main+4`, `draw::loop`, `next@$1A24`) returns the address and bank; `address` returns the nearest label at or below it, as `name+0xN`, or `null`. |
+| `load_symbols` | `path`\*, `replace` | Loads labels from a ca65/ld65 label file (`ld65 -Ln file.sym`: VICE-format lines such as `al 000801 .main`; other lines are skipped and counted) or from cc65 debug info (`ld65 --dbgfile file.dbg`), told apart by content. Labels are added to those already loaded unless `replace: true`; a file with no labels changes nothing. Returns `format` (`labels` or `debug_info`), `loaded`, `merged`, `scopes`, `source_lines` and `total`. The path must lie inside the host path root. |
+| `lookup_symbol` | `name` or `address` | `name` (`main`, `main+4`, `draw::loop`, `next@$1A24`) returns the address and bank; `address` returns the nearest label at or below it, as `name+0xN`, or `null`. With debug info, both also give the source position (`file`, `line`, `macro_file`, `macro_line`). |
 | `list_symbols` | `prefix`, `contains`, `include_linker`, `sort`, `limit`, `offset` | Lists the loaded symbols, to check what `load_symbols` read or to find entry points without guessing names (`prefix: "vex_"`). `prefix` keeps names that start with it and `contains` names that contain it (case-sensitive; both must match). Linker symbols such as `__BSS_SIZE__` are left out unless `include_linker: true`. `sort` is `name` (default) or `address`. Paged by `limit` (default 100, at most 1000) and `offset`. Returns `loaded`, `matching`, `returned` and the symbols as `name`, `address` and `bank` (`null` if none). |
 
 Once symbols are loaded:
@@ -502,6 +502,27 @@ debug info (`ld65 --dbgfile`, add `-g` to `ca65`) keeps the scopes, and
   scoped name; `merged` counts them.
 - Debug info has no X16 banks: labels from it carry none, like a label file
   with four-digit addresses.
+- **Source positions.** Results that name an address also give where it comes
+  from in the source: stop results (and, for a watchpoint, `accessing_pc_file`
+  and `accessing_pc_line`), `get_registers`, `set_breakpoint`,
+  `list_breakpoints`, `lookup_symbol` and `profile_report`'s `by: "address"`
+  entries. The fields are:
+  - `file` and `line`: the line as it is written where the code is. For code
+    from a macro, that is the line that uses the macro. For a `.repeat`, ca65
+    records the `.endrepeat` line. For C compiled by cc65, it is the C source
+    line, not the line of the generated `.s` file.
+  - `macro_file` and `macro_line`, only for code from a macro or `.repeat`: the
+    line in its body that produced the instruction. When macros are nested, it
+    is the innermost body line, and `file`/`line` are the outermost use.
+
+  For example, an instruction in one of five routines that a `LINE_CORE` macro
+  generates gives `"file": "lib/src/line.inc", "line": 349` (the `LINE_CORE`
+  line for that routine) and `"macro_line": 54` (the line in the macro). File
+  names are as the debug info has them, as they were passed to the assembler,
+  usually relative to the directory the build ran in. Addresses that no source
+  line covers (and everything, without debug info) have no `file` field.
+  `load_symbols` reports `source_lines`: the number of address ranges with a
+  source line.
 
 **Names several labels share.** Whatever is loaded, a name that more than one
 label has is never resolved silently:
@@ -569,8 +590,9 @@ without debug info) is grouped by label as in `by: "symbol"`, with
 scope view shows `tri_fill` as one entry at 19.7%.
 
 Entries of `by: "address"` give `address`, `bank`, `cycles`, `percent`, `count`
-(times executed), `symbol` (`name+0xN`) and `text` (the instruction as it is in
-memory now). With `sort: "address"` they come in address order, to read a
+(times executed), `symbol` (`name+0xN`), with debug info `file` and `line` (and
+`macro_file`/`macro_line` for code from a macro; see "Debug info and scopes"),
+and `text` (the instruction as it is in memory now). With `sort: "address"` they come in address order, to read a
 routine with the cost of each instruction.
 
 Filters: `from` and `to` (an inclusive range; numbers or labels), `bank` (for

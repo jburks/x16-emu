@@ -348,16 +348,44 @@ mcp_debug_check(void)
 	}
 }
 
+static void
+append_key(json_buf *b, const char *prefix, const char *key)
+{
+	json_buf_append(b, ",\"");
+	json_buf_append(b, prefix);
+	json_buf_append(b, key);
+	json_buf_append(b, "\":");
+}
+
 void
-mcp_append_symbol(json_buf *b, const char *key, uint16_t address)
+mcp_append_source(json_buf *b, const char *prefix, uint16_t address, int bank)
+{
+	mcp_sym_source src;
+	if (!mcp_sym_source_at(address, bank, &src)) return;
+	char tmp[16];
+	append_key(b, prefix, "file");
+	json_buf_append_string(b, src.file, strlen(src.file));
+	append_key(b, prefix, "line");
+	snprintf(tmp, sizeof(tmp), "%u", src.line);
+	json_buf_append(b, tmp);
+	if (src.macro_file) {
+		append_key(b, prefix, "macro_file");
+		json_buf_append_string(b, src.macro_file, strlen(src.macro_file));
+		append_key(b, prefix, "macro_line");
+		snprintf(tmp, sizeof(tmp), "%u", src.macro_line);
+		json_buf_append(b, tmp);
+	}
+}
+
+void
+mcp_append_position(json_buf *b, const char *prefix, uint16_t address)
 {
 	char sym[320];
 	if (mcp_sym_describe(address, sym, sizeof(sym))) {
-		json_buf_append(b, ",\"");
-		json_buf_append(b, key);
-		json_buf_append(b, "\":");
+		append_key(b, prefix, "symbol");
 		json_buf_append_string(b, sym, strlen(sym));
 	}
+	mcp_append_source(b, prefix, address, mcp_sym_current_bank(address));
 }
 
 const char *
@@ -403,8 +431,8 @@ mcp_describe_stop(json_buf *out)
 			         watch_hit.address, watch_hit.value, watch_hit.pc);
 		}
 		json_buf_append(out, tmp);
-		mcp_append_symbol(out, "accessing_pc_symbol", watch_hit.pc);
+		mcp_append_position(out, "accessing_pc_", watch_hit.pc);
 	}
-	mcp_append_symbol(out, "symbol", regs.pc);
+	mcp_append_position(out, "", regs.pc);
 	json_buf_append(out, "}");
 }

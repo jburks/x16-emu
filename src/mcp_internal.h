@@ -121,7 +121,12 @@ uint64_t mcp_total_cycles(void);
 
 // Appends ,"key":"name+0xN" (the nearest label at or below address) to a JSON object being built, if symbols
 // are loaded and one is close enough. Does nothing otherwise.
-void mcp_append_symbol(json_buf *b, const char *key, uint16_t address);
+// Appends ,"<prefix>symbol":"name+0xN" (if a label is near) and the source position of address from debug info
+// (,"<prefix>file", "<prefix>line", and for code from a macro "<prefix>macro_file", "<prefix>macro_line"), for the
+// current bank.
+void mcp_append_position(json_buf *b, const char *prefix, uint16_t address);
+// Appends only the source position fields, for an explicit bank (-1: none).
+void mcp_append_source(json_buf *b, const char *prefix, uint16_t address, int bank);
 
 // Helpers for tool implementations
 void mcp_job_fail(mcp_job *job, const char *message);  // sets is_error and the text

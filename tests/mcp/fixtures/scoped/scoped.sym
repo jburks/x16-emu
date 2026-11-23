@@ -1,3 +1,6 @@
+al 000437 ._count3
+al 000447 ._counter
+al 000428 .macros
 al 00040C .procA
 al 00041C .procB
 al 001234 .shared_const
@@ -12,3 +15,6 @@ al 000425 .table
 al 000424 .done
 al 000420 .loop
 al 00041C .procB
+al 000428 .macros
+al 000437 ._count3
+al 000447 ._counter

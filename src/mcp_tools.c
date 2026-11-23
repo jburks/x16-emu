@@ -120,14 +120,14 @@ run_get_registers(mcp_job *job)
 		memory_get_ram_bank(), memory_get_rom_bank(), mcp_is_paused() ? "true" : "false",
 		(unsigned long long)mcp_total_cycles());
 	json_buf_append(&job->text, tmp);
-	mcp_append_symbol(&job->text, "symbol", regs.pc);
+	mcp_append_position(&job->text, "", regs.pc);
 	json_buf_append(&job->text, "}");
 	return true;
 }
 
 static const mcp_tool tool_get_registers = {
 	"get_registers",
-	"Returns the 65C02 registers (pc, a, x, y, sp, status), the current RAM and ROM bank, whether the emulator is paused, and cycles: the exact number of CPU clock cycles executed since start. Subtract two values to measure what a routine costs.",
+	"Returns the 65C02 registers (pc, a, x, y, sp, status), the current RAM and ROM bank, whether the emulator is paused, and cycles: the exact number of CPU clock cycles executed since start. Subtract two values to measure what a routine costs. With symbols loaded, symbol names pc; with debug info, file and line give its source position (see load_symbols).",
 	"{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
 	run_get_registers,
 	0
@@ -663,7 +663,7 @@ run_set_breakpoint(mcp_job *job)
 	snprintf(tmp, sizeof(tmp), "{\"id\":%d,\"address\":\"0x%04X\",\"bank\":%s,\"already_set\":%s",
 	         id, address, bankstr, existed ? "true" : "false");
 	json_buf_append(&job->text, tmp);
-	mcp_append_symbol(&job->text, "symbol", (uint16_t)address);
+	mcp_append_position(&job->text, "", (uint16_t)address);
 	json_buf_append(&job->text, "}");
 	return true;
 }
@@ -739,7 +739,7 @@ run_list_breakpoints(mcp_job *job)
 			         i ? "," : "", id, address, bank, hits);
 		}
 		json_buf_append(&job->text, tmp);
-		mcp_append_symbol(&job->text, "symbol", address);
+		mcp_append_position(&job->text, "", address);
 		json_buf_append(&job->text, "}");
 		i++;
 	}
@@ -1626,9 +1626,9 @@ run_load_symbols(mcp_job *job)
 	}
 	char tmp[300];
 	snprintf(tmp, sizeof(tmp), "{\"format\":\"%s\",\"loaded\":%zu,\"%s\":%zu,\"merged\":%zu,\"scopes\":%zu,"
-	         "\"total\":%zu,\"replaced\":%s}", info.debug_info ? "debug_info" : "labels", info.added,
+	         "\"source_lines\":%zu,\"total\":%zu,\"replaced\":%s}", info.debug_info ? "debug_info" : "labels", info.added,
 	         info.debug_info ? "skipped_symbols" : "skipped_lines", info.skipped, info.merged, mcp_sym_scope_count(),
-	         mcp_sym_count(), rn && rn->boolean ? "true" : "false");
+	         mcp_sym_line_count(), mcp_sym_count(), rn && rn->boolean ? "true" : "false");
 	json_buf_append(&job->text, tmp);
 	return true;
 }
@@ -1646,10 +1646,13 @@ static const mcp_tool tool_load_symbols = {
 	"A label with a bank supplies it when you give none. Results then name addresses, as \"symbol\": "
 	"\"proc::label+0x12\" (the nearest label at or below, within 4096 bytes; from $A000 up only labels for the "
 	"current bank; linker symbols like __X_SIZE__ are skipped); a name that several labels still share after that "
-	"is shown as \"name@$XXXX\". Labels are case-sensitive. Symbols are added to those already loaded unless replace "
+	"is shown as \"name@$XXXX\". With debug info, results that name an address also give its source position: "
+	"file and line (the line as written: for code from a macro, the line that uses the macro; for .repeat, ca65 "
+	"records the .endrepeat line; for C compiled by cc65, the C line) and, for code from a macro or .repeat, "
+	"macro_file and macro_line (the line in its body; the innermost when macros are nested). Labels are case-sensitive. Symbols are added to those already loaded unless replace "
 	"is true; a label loaded twice (same address, bank and name) is kept once, preferring the scoped name, so a "
 	"program's label file and debug info can both be loaded. The result gives format (labels or debug_info), loaded, "
-	"merged, scopes and total. The path must lie inside the host path root, as for load_prg.",
+	"merged, scopes, source_lines (address ranges of source lines) and total. The path must lie inside the host path root, as for load_prg.",
 	"{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"replace\":{\"type\":\"boolean\",\"default\":false}},"
 	"\"required\":[\"path\"],\"additionalProperties\":false}",
 	run_load_symbols,
@@ -1678,11 +1681,13 @@ run_lookup_symbol(mcp_job *job)
 		snprintf(tmp, sizeof(tmp), "{\"address\":\"0x%04X\",\"bank\":", a);
 		json_buf_append(&job->text, tmp);
 		if (b >= 0) {
-			snprintf(tmp, sizeof(tmp), "%d}", b);
+			snprintf(tmp, sizeof(tmp), "%d", b);
 			json_buf_append(&job->text, tmp);
 		} else {
-			json_buf_append(&job->text, "null}");
+			json_buf_append(&job->text, "null");
 		}
+		mcp_append_source(&job->text, "", a, b >= 0 ? b : mcp_sym_current_bank(a));
+		json_buf_append(&job->text, "}");
 		return true;
 	}
 	uint32_t a;
@@ -1699,6 +1704,7 @@ run_lookup_symbol(mcp_job *job)
 	} else {
 		json_buf_append(&job->text, ",\"symbol\":null");
 	}
+	mcp_append_source(&job->text, "", (uint16_t)a, mcp_sym_current_bank((uint16_t)a));
 	json_buf_append(&job->text, "}");
 	return true;
 }
@@ -1707,7 +1713,8 @@ static const mcp_tool tool_lookup_symbol = {
 	"lookup_symbol",
 	"Looks a label up. With `name` (\"main\", \"main+4\") it returns the address and bank; with `address` it returns "
 	"the nearest label at or below it as \"name+0xN\" (null if none within 4096 bytes in the right region or bank). "
-	"Needs symbols loaded with load_symbols.",
+	"With debug info loaded, both also give the source position (file, line, and macro_file/macro_line for code "
+	"from a macro; see load_symbols). Needs symbols loaded with load_symbols.",
 	"{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"address\":{\"type\":[\"integer\",\"string\"]}},"
 	"\"additionalProperties\":false}",
 	run_lookup_symbol,
@@ -2646,6 +2653,7 @@ prof_append_address(json_buf *b, const prof_row *r, uint64_t total)
 		json_buf_append(b, ",\"symbol\":");
 		json_buf_append_string(b, sym, strlen(sym));
 	}
+	mcp_append_source(b, "", r->address, r->bank);
 	// The instruction as it is in memory now (code changed since it ran shows its new contents)
 	char line[96];
 	int32_t eff;
@@ -2836,7 +2844,8 @@ static const mcp_tool tool_profile_report = {
 	"cycles, percent and instructions. Nested scopes count for the innermost one, or with scope_level \"outermost\" "
 	"for the outermost. Code outside every scope is grouped by label as in by \"symbol\", with scope null. "
 	"by \"address\" lists single instructions: address, bank, cycles, percent, count (times executed), symbol "
-	"(name+0xN) and text (the instruction as it is in memory now); sort \"address\" lists them in address order, to "
+	"(name+0xN), with debug info file and line (and macro_file/macro_line for code from a macro; see load_symbols), "
+	"and text (the instruction as it is in memory now); sort \"address\" lists them in address order, to "
 	"read a routine with its costs. Filters: from/to (inclusive addresses or labels), bank (for $A000 up), within (a "
 	"scope path: every address inside that scope, nested ones included; otherwise a label: the addresses that belong "
 	"to it). Paged by limit (default 50, max 1000) and offset. With path the "

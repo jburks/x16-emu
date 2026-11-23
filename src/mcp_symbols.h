@@ -74,4 +74,25 @@ bool mcp_sym_is_scope(const char *path);
 // Whether address lies in the scope path, or in a scope nested in it.
 bool mcp_sym_in_scope(uint16_t address, int bank, const char *path);
 
+// The source position of the code at address, from debug info. *file and *line: the line as written where the
+// code is: for code from a macro (or .repeat), the line that uses the macro (for .repeat, ca65 records the
+// .endrepeat line); for C compiled by cc65, the C source line. macro_file and macro_line: for code from a macro or
+// .repeat, the line inside its body that produced the code (the innermost body when macros are nested), else
+// NULL and 0. File names are as the debug info gives them (as passed to the assembler) and stay valid until the
+// symbols are next loaded with replace. Ranges above $FFFF (with a bank) only match that bank. False if no
+// loaded source line covers address.
+typedef struct {
+	const char *file;
+	unsigned line;
+	const char *macro_file;
+	unsigned macro_line;
+} mcp_sym_source;
+bool mcp_sym_source_at(uint16_t address, int bank, mcp_sym_source *out);
+
+// Number of address ranges of source lines loaded from debug info.
+size_t mcp_sym_line_count(void);
+
+// The bank the CPU sees at address now: -1 below $A000, else the current RAM or ROM bank.
+int mcp_sym_current_bank(uint16_t address);
+
 #endif
