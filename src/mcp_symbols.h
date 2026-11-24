@@ -89,6 +89,12 @@ typedef struct {
 } mcp_sym_source;
 bool mcp_sym_source_at(uint16_t address, int bank, mcp_sym_source *out);
 
+// Whether a jump from -> to (a JMP or a taken branch) is a tail call: `to` is the start of a named scope (a .proc
+// or .scope from debug info), and `from` is not in the same outermost scope (a jump to a routine's own start, or
+// between a .proc and the scopes nested in it, stays within one routine). Fast when `to` is not a scope start. Matches
+// profiler_tail_fn.
+bool mcp_sym_is_tail_call(uint16_t from, uint16_t to, int bank);
+
 // Number of address ranges of source lines loaded from debug info.
 size_t mcp_sym_line_count(void);
 

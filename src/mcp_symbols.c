@@ -50,6 +50,7 @@ static size_t file_count;
 static line_range_t *lines;   // sorted by the address part of start
 static size_t line_count;
 static uint32_t *line_reach;  // line_reach[i]: the highest end (address part) of lines[0..i]
+static uint8_t scope_starts[0x10000 / 8]; // bit set: some scope range starts at that address (any bank)
 
 // ---- growable arrays used while a file is read ----
 
@@ -157,6 +158,7 @@ free_all(void)
 	free(files); free(lines); free(line_reach);
 	symbols = NULL; by_name = by_short = by_addr = NULL; scopes = NULL;
 	files = NULL; lines = NULL; line_reach = NULL;
+	memset(scope_starts, 0, sizeof(scope_starts));
 	count = scope_count = file_count = line_count = 0;
 }
 
@@ -277,6 +279,11 @@ rebuild_indexes(void)
 	qsort(by_short, count, sizeof(*by_short), cmp_short);
 	qsort(by_addr, count, sizeof(*by_addr), cmp_addr);
 	if (scope_count) qsort(scopes, scope_count, sizeof(*scopes), cmp_scope);
+	memset(scope_starts, 0, sizeof(scope_starts));
+	for (size_t i = 0; i < scope_count; i++) {
+		uint16_t a = (uint16_t)(scopes[i].start & 0xFFFF);
+		scope_starts[a >> 3] |= (uint8_t)(1 << (a & 7));
+	}
 
 	// A name that several labels share is shown with the address: next@$1A24
 	for (size_t i = 0; i < count;) {
@@ -1101,4 +1108,26 @@ mcp_sym_source_at(uint16_t address, int bank, mcp_sym_source *out)
 		out->macro_line = body->line;
 	}
 	return true;
+}
+
+bool
+mcp_sym_is_tail_call(uint16_t from, uint16_t to, int bank)
+{
+	if (!(scope_starts[to >> 3] & (1 << (to & 7)))) return false;
+	// the outermost scope starting exactly at `to` (nested scopes can share a start), for that bank
+	const scope_range_t *best = NULL;
+	for (size_t i = 0; i < scope_count && (scopes[i].start & 0xFFFF) <= to; i++) {
+		const scope_range_t *r = &scopes[i];
+		if ((r->start & 0xFFFF) != to) continue;
+		if (r->start > 0xFFFF && (to < 0xA000 || (int)(r->start >> 16) != bank)) continue;
+		if (!best || r->size > best->size) best = r;
+	}
+	if (!best) return false;
+	// A jump within one routine is not a call: to its own start (a loop), or between a .proc and the scopes nested
+	// in it. So `from` and `to` must not share their outermost scope.
+	const char *outer;
+	uint16_t ostart;
+	if (!mcp_sym_scope_at(from, bank, true, &outer, &ostart)) return true;
+	size_t ol = strlen(outer);
+	return !(strncmp(best->path, outer, ol) == 0 && (best->path[ol] == 0 || !strncmp(best->path + ol, "::", 2)));
 }

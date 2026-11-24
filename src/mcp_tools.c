@@ -2438,6 +2438,17 @@ prof_append_summary(json_buf *b)
 	         (unsigned long long)t.wait_cycles, other, (unsigned long long)t.unmapped_cycles,
 	         (unsigned long long)t.instructions);
 	json_buf_append(b, tmp);
+	if (profiler_has_calls()) {
+		profiler_call_totals c;
+		profiler_get_call_totals(&c);
+		snprintf(tmp, sizeof(tmp),
+		         ",\"call_tracking\":{\"calls\":%llu,\"tail_calls\":%llu,\"interrupts\":%llu,\"interrupt_cycles\":%llu,"
+		         "\"max_depth\":%u,\"open_frames\":%u,\"depth_overflows\":%llu%s}",
+		         (unsigned long long)c.calls, (unsigned long long)c.tail_calls, (unsigned long long)c.interrupts,
+		         (unsigned long long)c.interrupt_cycles, c.max_depth, c.open_frames, (unsigned long long)c.depth_overflows,
+		         c.out_of_memory ? ",\"out_of_memory\":true" : "");
+		json_buf_append(b, tmp);
+	}
 }
 
 static bool
@@ -2449,8 +2460,14 @@ run_profile_start(mcp_job *job)
 		return true;
 	}
 	bool reset = !r || r->boolean;
+	const json_node *cn = json_get(job->args, "calls");
+	if (cn && cn->type != JSON_BOOL) {
+		mcp_job_fail(job, "calls must be true or false");
+		return true;
+	}
+	bool calls = cn && cn->boolean;
 	bool was_on = profiler_on();
-	if (!profiler_start(reset)) {
+	if (!profiler_start(reset, calls, calls ? mcp_sym_is_tail_call : NULL)) {
 		mcp_job_fail(job, "out of memory for the profile");
 		return true;
 	}
@@ -2462,8 +2479,8 @@ run_profile_start(mcp_job *job)
 	prof_segment_start = mcp_total_cycles();
 	prof_started = true;
 	char tmp[200];
-	snprintf(tmp, sizeof(tmp), "{\"profiling\":true,\"reset\":%s,\"cycles_at_start\":%llu}", reset ? "true" : "false",
-	         (unsigned long long)prof_segment_start);
+	snprintf(tmp, sizeof(tmp), "{\"profiling\":true,\"reset\":%s,\"calls\":%s,\"cycles_at_start\":%llu}",
+	         reset ? "true" : "false", calls ? "true" : "false", (unsigned long long)prof_segment_start);
 	json_buf_append(&job->text, tmp);
 	return true;
 }
@@ -2474,9 +2491,16 @@ static const mcp_tool tool_profile_start = {
 	"counter for its address (and bank, from $A000 up). The counts are exact, in emulated cycles, and nothing is "
 	"sampled, so the same code gives the same profile every time. Tool calls take no emulated time, so starting "
 	"while paused at a breakpoint and stopping at another (or around run_frames) profiles exactly that stretch. "
-	"reset (default true) clears earlier counts; reset false adds to them. Profiling slows the emulator down a "
-	"little; profile_stop ends it. Read the results with profile_report.",
-	"{\"type\":\"object\",\"properties\":{\"reset\":{\"type\":\"boolean\",\"default\":true}},\"additionalProperties\":false}",
+	"reset (default true) clears earlier counts; reset false adds to them. With calls true it also tracks "
+	"subroutine calls, for profile_report by \"routine\": each routine's cycles including what it calls, call "
+	"counts, cost per call, callers and callees. A call is a JSR (or JSL); it ends when the stack pointer, after "
+	"a return or TXS, is above the call's return address, so dropped return addresses and RTS jump tables do not "
+	"confuse it. Interrupts get frames of their own and are left out of the routine they interrupted. With cc65 "
+	"debug info loaded, a JMP or branch to the start of a .proc from outside it is a tail call: the routine jumped "
+	"to replaces the one that jumped. Calls made before profile_start are not known. Profiling slows the emulator "
+	"down a little (call tracking a little more); profile_stop ends it. Read the results with profile_report.",
+	"{\"type\":\"object\",\"properties\":{\"reset\":{\"type\":\"boolean\",\"default\":true},"
+	"\"calls\":{\"type\":\"boolean\",\"default\":false}},\"additionalProperties\":false}",
 	run_profile_start,
 	0
 };
@@ -2666,6 +2690,368 @@ prof_append_address(json_buf *b, const prof_row *r, uint64_t total)
 	json_buf_append(b, "}");
 }
 
+// ---- by "routine" (call tracking) ----
+
+typedef struct {
+	profiler_routine r;
+	const char *sym;      // the label at or below the routine's address
+	uint16_t sym_address;
+	bool has_self;
+	uint64_t self;
+} prof_routine_row;
+
+typedef struct {
+	prof_routine_row *rows;
+	size_t n, cap;
+	bool oom;
+} prof_routine_rows;
+
+static void
+prof_collect_routine(void *ctx, const profiler_routine *r)
+{
+	prof_routine_rows *rr = ctx;
+	if (rr->oom) return;
+	if (rr->n == rr->cap) {
+		size_t cap = rr->cap ? rr->cap * 2 : 256;
+		prof_routine_row *nr = realloc(rr->rows, cap * sizeof(*nr));
+		if (!nr) {
+			rr->oom = true;
+			return;
+		}
+		rr->rows = nr;
+		rr->cap = cap;
+	}
+	prof_routine_row *row = &rr->rows[rr->n++];
+	memset(row, 0, sizeof(*row));
+	row->r = *r;
+}
+
+typedef struct {
+	profiler_edge *v;
+	size_t n, cap;
+	bool oom;
+} prof_edges;
+
+static void
+prof_collect_edge(void *ctx, const profiler_edge *e)
+{
+	prof_edges *pe = ctx;
+	if (pe->oom) return;
+	if (pe->n == pe->cap) {
+		size_t cap = pe->cap ? pe->cap * 2 : 256;
+		profiler_edge *nv = realloc(pe->v, cap * sizeof(*nv));
+		if (!nv) {
+			pe->oom = true;
+			return;
+		}
+		pe->v = nv;
+		pe->cap = cap;
+	}
+	pe->v[pe->n++] = *e;
+}
+
+// Self cycles: the address view's cycles grouped as by "scope" does (innermost scope, else the nearest label),
+// keyed by the group's start address and bank.
+typedef struct {
+	uint64_t key, cycles;
+} prof_self;
+
+static uint64_t
+prof_key(uint16_t address, int bank)
+{
+	return address | (uint64_t)(address < 0xA000 ? 0 : bank + 1) << 16;
+}
+
+static int
+prof_by_key(const void *a, const void *b)
+{
+	uint64_t x = ((const prof_self *)a)->key, y = ((const prof_self *)b)->key;
+	return x < y ? -1 : x > y;
+}
+
+static void
+prof_append_routine_name(json_buf *b, const char *key, const char *sym, uint16_t sym_address, uint16_t address)
+{
+	json_buf_append(b, key);
+	if (!sym) {
+		json_buf_append(b, "null");
+		return;
+	}
+	char name[320];
+	if (address != sym_address) snprintf(name, sizeof(name), "%s+0x%X", sym, (unsigned)(address - sym_address));
+	else snprintf(name, sizeof(name), "%s", sym);
+	json_buf_append_string(b, name, strlen(name));
+}
+
+// One routine entry, without the closing brace.
+static void
+prof_append_routine(json_buf *b, const prof_routine_row *row, uint64_t total)
+{
+	char tmp[300];
+	prof_append_routine_name(b, "{\"routine\":", row->sym, row->sym_address, row->r.address);
+	snprintf(tmp, sizeof(tmp), ",\"address\":\"0x%04X\"", row->r.address);
+	json_buf_append(b, tmp);
+	prof_append_bank(b, row->r.bank);
+	snprintf(tmp, sizeof(tmp), ",\"calls\":%llu,\"cycles\":%llu", (unsigned long long)row->r.calls,
+	         (unsigned long long)row->r.cycles);
+	json_buf_append(b, tmp);
+	prof_append_percent(b, row->r.cycles, total);
+	if (row->has_self) {
+		snprintf(tmp, sizeof(tmp), ",\"self_cycles\":%llu", (unsigned long long)row->self);
+		json_buf_append(b, tmp);
+	} else {
+		json_buf_append(b, ",\"self_cycles\":null");
+	}
+	snprintf(tmp, sizeof(tmp), ",\"cycles_per_call\":%llu",
+	         (unsigned long long)(row->r.calls ? row->r.cycles / row->r.calls : 0));
+	json_buf_append(b, tmp);
+	if (row->r.returned) {
+		snprintf(tmp, sizeof(tmp), ",\"min_cycles\":%llu,\"max_cycles\":%llu", (unsigned long long)row->r.min,
+		         (unsigned long long)row->r.max);
+		json_buf_append(b, tmp);
+	}
+	if (row->r.returned != row->r.calls) {
+		snprintf(tmp, sizeof(tmp), ",\"running\":%llu", (unsigned long long)(row->r.calls - row->r.returned));
+		json_buf_append(b, tmp);
+	}
+	mcp_append_source(b, "", row->r.address, row->r.bank);
+}
+
+typedef struct {
+	const profiler_edge *e;
+	bool caller_side; // a callers entry (name the caller), else a callees entry (name the callee)
+} prof_edge_ref;
+
+static int
+prof_edge_by_cycles(const void *a, const void *b)
+{
+	const profiler_edge *x = ((const prof_edge_ref *)a)->e, *y = ((const prof_edge_ref *)b)->e;
+	if (x->cycles != y->cycles) return x->cycles < y->cycles ? 1 : -1;
+	return x->calls < y->calls ? 1 : x->calls > y->calls ? -1 : 0;
+}
+
+static void
+prof_append_edges(json_buf *b, const char *key, prof_edge_ref *refs, size_t n, uint64_t total)
+{
+	qsort(refs, n, sizeof(*refs), prof_edge_by_cycles);
+	json_buf_append(b, key);
+	json_buf_append(b, "[");
+	char tmp[200];
+	for (size_t i = 0; i < n; i++) {
+		const profiler_edge *e = refs[i].e;
+		if (i) json_buf_append(b, ",");
+		bool caller = refs[i].caller_side;
+		if (caller && e->caller_kind != PROFILER_CALLER_ROUTINE) {
+			json_buf_append(b, e->caller_kind == PROFILER_CALLER_NONE ? "{\"routine\":null,\"from\":\"outside\""
+			                                                          : "{\"routine\":null,\"from\":\"interrupt\"");
+		} else {
+			uint16_t a = caller ? e->caller_address : e->callee_address;
+			int bk = caller ? e->caller_bank : e->callee_bank;
+			mcp_sym_entry se;
+			bool named = mcp_sym_nearest(a, bk, &se);
+			prof_append_routine_name(b, "{\"routine\":", named ? se.name : NULL, named ? se.address : 0, a);
+			snprintf(tmp, sizeof(tmp), ",\"address\":\"0x%04X\"", a);
+			json_buf_append(b, tmp);
+			prof_append_bank(b, bk);
+		}
+		snprintf(tmp, sizeof(tmp), ",\"calls\":%llu,\"cycles\":%llu", (unsigned long long)e->calls,
+		         (unsigned long long)e->cycles);
+		json_buf_append(b, tmp);
+		prof_append_percent(b, e->cycles, total);
+		json_buf_append(b, "}");
+	}
+	json_buf_append(b, "]");
+}
+
+static int
+prof_routine_by_cycles(const void *a, const void *b)
+{
+	const prof_routine_row *x = a, *y = b;
+	if (x->r.cycles != y->r.cycles) return x->r.cycles < y->r.cycles ? 1 : -1;
+	uint64_t kx = prof_key(x->r.address, x->r.bank), ky = prof_key(y->r.address, y->r.bank);
+	return kx < ky ? -1 : kx > ky;
+}
+
+static int
+prof_routine_by_calls(const void *a, const void *b)
+{
+	const prof_routine_row *x = a, *y = b;
+	if (x->r.calls != y->r.calls) return x->r.calls < y->r.calls ? 1 : -1;
+	return prof_routine_by_cycles(a, b);
+}
+
+static int
+prof_routine_by_address(const void *a, const void *b)
+{
+	const prof_routine_row *x = a, *y = b;
+	uint64_t kx = prof_key(x->r.address, x->r.bank), ky = prof_key(y->r.address, y->r.bank);
+	return kx < ky ? -1 : kx > ky;
+}
+
+typedef struct {
+	uint32_t from, to, bank, limit, offset;
+	bool have_bank;
+	const char *within, *sort, *path, *resolved;
+	bool overwrite;
+	bool have_routine;   // one routine, with its callers and callees
+	uint16_t routine;
+	int routine_bank;    // -1: any
+} prof_routine_args;
+
+static bool
+prof_report_routines(mcp_job *job, const prof_routine_args *a)
+{
+	if (!profiler_has_calls()) {
+		mcp_job_fail(job, "by \"routine\" needs call tracking: profile_start with calls: true, run the code, then report");
+		return true;
+	}
+	prof_routine_rows rr = { 0 };
+	profiler_visit_routines(prof_collect_routine, &rr);
+	prof_rows rows = { 0 };
+	profiler_visit(prof_collect, &rows);
+	prof_self *self = malloc((rows.n ? rows.n : 1) * sizeof(*self));
+	if (rr.oom || rows.oom || !self) {
+		free(rr.rows); free(rows.rows); free(self);
+		mcp_job_fail(job, "out of memory");
+		return true;
+	}
+	// Self cycles per group (innermost scope, else nearest label)
+	size_t ns = 0;
+	for (size_t i = 0; i < rows.n; i++) {
+		const prof_row *r = &rows.rows[i];
+		const char *sp;
+		uint16_t start;
+		mcp_sym_entry e;
+		if (mcp_sym_scope_at(r->address, r->bank, false, &sp, &start)) {
+			self[ns].key = prof_key(start, r->bank);
+		} else if (mcp_sym_nearest(r->address, r->bank, &e)) {
+			self[ns].key = prof_key(e.address, r->bank);
+		} else {
+			continue;
+		}
+		self[ns++].cycles = r->cycles;
+	}
+	free(rows.rows);
+	qsort(self, ns, sizeof(*self), prof_by_key);
+	size_t m = 0;
+	for (size_t i = 0; i < ns; i++) {
+		if (m && self[m - 1].key == self[i].key) self[m - 1].cycles += self[i].cycles;
+		else self[m++] = self[i];
+	}
+	ns = m;
+
+	bool within_scope = a->within && mcp_sym_is_scope(a->within);
+	size_t n = 0;
+	for (size_t i = 0; i < rr.n; i++) {
+		prof_routine_row row = rr.rows[i];
+		uint16_t ad = row.r.address;
+		if (a->have_routine) {
+			if (ad != a->routine || (a->routine_bank >= 0 && ad >= 0xA000 && row.r.bank != a->routine_bank)) continue;
+		} else {
+			if (ad < a->from || ad > a->to) continue;
+			if (a->have_bank && ad >= 0xA000 && row.r.bank != (int)a->bank) continue;
+		}
+		mcp_sym_entry e;
+		if (mcp_sym_nearest(ad, row.r.bank, &e)) {
+			row.sym = e.name;
+			row.sym_address = e.address;
+		}
+		if (a->within && (within_scope ? !mcp_sym_in_scope(ad, row.r.bank, a->within) : (!row.sym || strcmp(row.sym, a->within)))) {
+			continue;
+		}
+		prof_self key = { prof_key(ad, row.r.bank), 0 };
+		const prof_self *f = ns ? bsearch(&key, self, ns, sizeof(*self), prof_by_key) : NULL;
+		if (f) {
+			row.has_self = true;
+			row.self = f->cycles;
+		}
+		rr.rows[n++] = row;
+	}
+	free(self);
+	qsort(rr.rows, n, sizeof(*rr.rows), !strcmp(a->sort, "calls") ? prof_routine_by_calls
+	      : !strcmp(a->sort, "address") ? prof_routine_by_address : prof_routine_by_cycles);
+
+	uint64_t total = prof_window_cycles();
+	json_buf *t = &job->text;
+	char tmp[200];
+	if (a->have_routine) {
+		if (n == 0) {
+			free(rr.rows);
+			snprintf(tmp, sizeof(tmp), "no call of $%04X was seen (only addresses reached by JSR/JSL or a tail call are "
+			         "routines)", a->routine);
+			mcp_job_fail(job, tmp);
+			return true;
+		}
+		prof_edges pe = { 0 };
+		profiler_visit_edges(prof_collect_edge, &pe);
+		prof_edge_ref *refs = malloc((pe.n ? pe.n : 1) * sizeof(*refs));
+		if (pe.oom || !refs) {
+			free(rr.rows); free(pe.v); free(refs);
+			mcp_job_fail(job, "out of memory");
+			return true;
+		}
+		json_buf_append(t, "{");
+		prof_append_summary(t);
+		json_buf_append(t, ",\"by\":\"routine\",\"routines\":[");
+		for (size_t k = 0; k < n; k++) { // one, or one per bank when the routine's bank was not given
+			const prof_routine_row *row = &rr.rows[k];
+			if (k) json_buf_append(t, ",");
+			prof_append_routine(t, row, total);
+			size_t nr = 0;
+			for (size_t i = 0; i < pe.n; i++) {
+				if (pe.v[i].callee_address == row->r.address && pe.v[i].callee_bank == row->r.bank) {
+					refs[nr++] = (prof_edge_ref){ &pe.v[i], true };
+				}
+			}
+			prof_append_edges(t, ",\"callers\":", refs, nr, total);
+			nr = 0;
+			for (size_t i = 0; i < pe.n; i++) {
+				if (pe.v[i].caller_kind == PROFILER_CALLER_ROUTINE && pe.v[i].caller_address == row->r.address &&
+				    pe.v[i].caller_bank == row->r.bank) {
+					refs[nr++] = (prof_edge_ref){ &pe.v[i], false };
+				}
+			}
+			prof_append_edges(t, ",\"callees\":", refs, nr, total);
+			json_buf_append(t, "}");
+		}
+		json_buf_append(t, "]}");
+		free(refs); free(pe.v); free(rr.rows);
+		return true;
+	}
+
+	size_t first = a->offset < n ? a->offset : n;
+	size_t count = a->path ? n : (n - first < a->limit ? n - first : a->limit);
+	if (a->path) first = 0;
+	json_buf report;
+	json_buf_init(&report);
+	json_buf *out = a->path ? &report : t;
+	json_buf_append(out, "{");
+	prof_append_summary(out);
+	snprintf(tmp, sizeof(tmp), ",\"by\":\"routine\",\"entries_total\":%zu,\"offset\":%zu,\"returned\":%zu,\"entries\":[",
+	         n, first, count);
+	json_buf_append(out, tmp);
+	for (size_t i = 0; i < count; i++) {
+		if (i) json_buf_append(out, ",");
+		prof_append_routine(out, &rr.rows[first + i], total);
+		json_buf_append(out, "}");
+	}
+	json_buf_append(out, "]}");
+	free(rr.rows);
+	if (a->path) {
+		bool ok = dump_to_file(job, a->resolved, (const uint8_t *)report.data, report.len, a->overwrite);
+		size_t bytes = report.len;
+		json_buf_free(&report);
+		if (!ok) return true;
+		json_buf_append(t, "{");
+		prof_append_summary(t);
+		snprintf(tmp, sizeof(tmp), ",\"by\":\"routine\",\"entries_total\":%zu,\"bytes\":%zu,\"path\":", n, bytes);
+		json_buf_append(t, tmp);
+		json_buf_append_string(t, a->resolved, strlen(a->resolved));
+		json_buf_append(t, "}");
+	}
+	return true;
+}
+
 static bool
 run_profile_report(mcp_job *job)
 {
@@ -2674,9 +3060,15 @@ run_profile_report(mcp_job *job)
 		return true;
 	}
 	const json_node *byn = json_get(job->args, "by"), *sn = json_get(job->args, "sort"), *wn = json_get(job->args, "within");
-	const char *by = byn ? json_as_string(byn) : "symbol";
-	if (!by || (strcmp(by, "symbol") && strcmp(by, "scope") && strcmp(by, "address"))) {
-		mcp_job_fail(job, "by must be \"symbol\", \"scope\" or \"address\"");
+	const json_node *rtn = json_get(job->args, "routine");
+	const char *by = byn ? json_as_string(byn) : rtn ? "routine" : "symbol";
+	if (!by || (strcmp(by, "symbol") && strcmp(by, "scope") && strcmp(by, "address") && strcmp(by, "routine"))) {
+		mcp_job_fail(job, "by must be \"symbol\", \"scope\", \"address\" or \"routine\"");
+		return true;
+	}
+	bool by_routine = !strcmp(by, "routine");
+	if (rtn && !by_routine) {
+		mcp_job_fail(job, "routine applies to by \"routine\" only");
 		return true;
 	}
 	bool by_scope = !strcmp(by, "scope");
@@ -2697,12 +3089,16 @@ run_profile_report(mcp_job *job)
 		return true;
 	}
 	const char *sort = sn ? json_as_string(sn) : "cycles";
-	if (!sort || (strcmp(sort, "cycles") && strcmp(sort, "address"))) {
-		mcp_job_fail(job, "sort must be \"cycles\" or \"address\"");
+	if (!sort || (strcmp(sort, "cycles") && strcmp(sort, "address") && strcmp(sort, "calls"))) {
+		mcp_job_fail(job, "sort must be \"cycles\", \"address\" or \"calls\"");
+		return true;
+	}
+	if (!strcmp(sort, "calls") && !by_routine) {
+		mcp_job_fail(job, "sort \"calls\" applies to by \"routine\" only");
 		return true;
 	}
 	if (sn && by_symbol) {
-		mcp_job_fail(job, "sort applies to by \"address\" only (symbols and scopes are always ordered by cycles)");
+		mcp_job_fail(job, "sort applies to by \"address\" and \"routine\" only (symbols and scopes are always ordered by cycles)");
 		return true;
 	}
 	const char *within = NULL;
@@ -2745,6 +3141,25 @@ run_profile_report(mcp_job *job)
 	char resolved[1100];
 	if (path && !host_path(job, path, resolved, sizeof(resolved))) {
 		return true;
+	}
+	if (by_routine) {
+		prof_routine_args ra = { from, to, bank, limit, offset, have_bank, within, sort, path, resolved, overwrite, false, 0, -1 };
+		if (rtn) {
+			uint32_t ad;
+			int rb;
+			if (!arg_addr(job, "routine", &ad, &rb) || ad > 0xFFFF) {
+				if (!job->is_error) mcp_job_fail(job, "routine must be an address from 0 to 0xFFFF, or a label");
+				return true;
+			}
+			if (path) {
+				mcp_job_fail(job, "path applies to the routine list, not to one routine");
+				return true;
+			}
+			ra.have_routine = true;
+			ra.routine = (uint16_t)ad;
+			ra.routine_bank = have_bank ? (int)bank : rb;
+		}
+		return prof_report_routines(job, &ra);
 	}
 
 	prof_rows rows = { 0 };
@@ -2846,15 +3261,24 @@ static const mcp_tool tool_profile_report = {
 	"by \"address\" lists single instructions: address, bank, cycles, percent, count (times executed), symbol "
 	"(name+0xN), with debug info file and line (and macro_file/macro_line for code from a macro; see load_symbols), "
 	"and text (the instruction as it is in memory now); sort \"address\" lists them in address order, to "
-	"read a routine with its costs. Filters: from/to (inclusive addresses or labels), bank (for $A000 up), within (a "
+	"read a routine with its costs. by \"routine\" (needs profile_start with calls true) lists called routines: "
+	"routine (name), address, bank, calls, cycles (from call to return including everything it calls, interrupts "
+	"left out; a recursive routine counts its outermost call), percent, self_cycles (its own instructions, as its "
+	"entry in by \"scope\", or by \"symbol\" without debug info; null if the routine does not start a scope or "
+	"label), cycles_per_call, min_cycles and max_cycles (over returned calls), running (calls not yet returned, "
+	"counted up to now), file and line; sort \"calls\" orders by calls. Percentages of routines overlap (a caller "
+	"includes its callees). With routine (a label or address) it returns just that routine with callers and "
+	"callees: each with calls and the callee's cycles for those calls; a caller can be null with from "
+	"\"outside\" (no tracked routine) or \"interrupt\". Filters: from/to (inclusive addresses or labels), bank (for $A000 up), within (a "
 	"scope path: every address inside that scope, nested ones included; otherwise a label: the addresses that belong "
 	"to it). Paged by limit (default 50, max 1000) and offset. With path the "
 	"whole report (every entry) is written to that host file as JSON, inside the host path root, and only the totals "
 	"are returned; an existing file is replaced only with overwrite.",
 	"{\"type\":\"object\",\"properties\":{"
-		"\"by\":{\"type\":\"string\",\"enum\":[\"symbol\",\"scope\",\"address\"],\"default\":\"symbol\"},"
+		"\"by\":{\"type\":\"string\",\"enum\":[\"symbol\",\"scope\",\"address\",\"routine\"],\"default\":\"symbol\"},"
+		"\"routine\":{\"type\":[\"integer\",\"string\"]},"
 		"\"scope_level\":{\"type\":\"string\",\"enum\":[\"innermost\",\"outermost\"],\"default\":\"innermost\"},"
-		"\"sort\":{\"type\":\"string\",\"enum\":[\"cycles\",\"address\"],\"default\":\"cycles\"},"
+		"\"sort\":{\"type\":\"string\",\"enum\":[\"cycles\",\"address\",\"calls\"],\"default\":\"cycles\"},"
 		"\"from\":{\"type\":[\"integer\",\"string\"]},\"to\":{\"type\":[\"integer\",\"string\"]},"
 		"\"bank\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255},"
 		"\"within\":{\"type\":\"string\"},"

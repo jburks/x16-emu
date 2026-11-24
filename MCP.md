@@ -546,9 +546,9 @@ same profile every time.
 
 | Tool | Arguments | What it does |
 |---|---|---|
-| `profile_start` | `reset` | Starts counting. `reset` (default `true`) clears earlier counts; `false` adds to them. |
+| `profile_start` | `reset`, `calls` | Starts counting. `reset` (default `true`) clears earlier counts; `false` adds to them. `calls: true` also tracks subroutine calls, for `by: "routine"`. |
 | `profile_stop` | none | Stops counting and returns the totals. The counts are kept until the next `profile_start` with `reset`. |
-| `profile_report` | `by`, `scope_level`, `sort`, `from`, `to`, `bank`, `within`, `limit`, `offset`, `path`, `overwrite` | The totals and the counted entries, highest cycles first. `by: "symbol"` (default) adds up the addresses of each label; `by: "scope"` adds up each routine (needs debug info); `by: "address"` lists single instructions. |
+| `profile_report` | `by`, `routine`, `scope_level`, `sort`, `from`, `to`, `bank`, `within`, `limit`, `offset`, `path`, `overwrite` | The totals and the counted entries, highest cycles first. `by: "symbol"` (default) adds up the addresses of each label; `by: "scope"` adds up each routine (needs debug info); `by: "address"` lists single instructions; `by: "routine"` lists called routines with the time of what they call (needs `calls: true`), and `routine` gives one routine with its callers and callees. |
 
 Every result starts with the totals:
 
@@ -615,12 +615,92 @@ Tips:
   the same counts.
 - **Find the hot routines, then the hot instructions:** `by: "scope"` first,
   then `by: "address"` with `within: "<the routine>"` and `sort: "address"`.
+- **Find what a routine costs with everything it calls:** `calls: true`, then
+  `by: "routine"`, then `routine: "<name>"` for where its time goes.
 - Profiling makes the emulator a little slower; stop it when you are done.
   `get_status` shows `profiling`.
-- The profile counts cycles per address only. It does not know which routine
-  called which, so the time of a routine's callees is not added to it, and a
-  routine reached with `JMP` (instead of `JSR`) is reported under its own label
-  like any other code.
+
+#### Calls: time including callees
+
+The views above count cycles per address, so a routine that is cheap itself
+but calls expensive helpers looks cheap. With `profile_start` and
+`calls: true`, the profiler also follows subroutine calls, and
+`profile_report` with `by: "routine"` lists each routine with the time of
+everything it calls.
+
+How calls are followed:
+
+- A `JSR` (or `JSL`) starts a call of the routine at its target. The call ends
+  when the stack pointer, after a return (`RTS`, `RTI`, `RTL`) or `TXS`, is
+  above the call's return address. Tricks that use the stack therefore come out
+  right:
+  - A routine that drops its caller's return address (`PLA PLA`) and returns
+    ends both calls at its `RTS`.
+  - An `RTS` jump table (push an address, `RTS`) is not a call. The code it
+    reaches counts for the routine that did it.
+  - Inline data after a `JSR` that the routine skips by changing its return
+    address is fine.
+- Interrupts (IRQ, NMI, `BRK`, `COP`) get calls of their own. Their time,
+  entry included, is left out of the routine they interrupted. Routines that
+  the interrupt handler calls are tracked like any other routine; their caller
+  is `from: "interrupt"`.
+- **Tail calls**, with cc65 debug info loaded: a `JMP` (or a taken branch) to
+  the start of a `.proc` from outside that `.proc` counts as a call. The
+  routine jumped to replaces the one that jumped: it returns to that routine's
+  caller, and its time counts for that caller, not for the routine that
+  jumped. A jump within one `.proc`, including into a `.proc` nested in it, is
+  not a call. A jump into the middle of a routine is not a call either; that
+  code counts for the routine that jumped. Without debug info, code reached by
+  `JMP` counts for the routine that jumped.
+- Calls made before `profile_start` are unknown: returns from them are
+  ignored, and code they run counts for no routine until a new call starts.
+  `profile_stop` ends calls still running.
+- KERNAL calls through `jsrfar` show up as calls of `jsrfar`, not of the
+  routine in the other bank.
+
+Entries of `by: "routine"` give:
+
+- `routine`, the label at the routine's address, or `name+0xN`, or `null`
+  without one. Also `address` and `bank`.
+- `calls`, the number of times it was called.
+- `cycles` and `percent`: from each call until its return, including
+  everything it calls, but not interrupts. A recursive routine counts its
+  outermost call only. Calls that have not returned yet count up to now, and
+  `running` says how many there are. Routines overlap, so percentages add up
+  to more than 100.
+- `self_cycles`: the routine's own instructions, the same as its entry in
+  `by: "scope"` (or `by: "symbol"` without debug info). It counts the
+  routine's code however that code was reached, including through an `RTS`
+  jump table or a jump into its middle, so it can exceed `cycles`. It is
+  `null` when the routine does not start a scope (or label) of its own, such
+  as a label inside a `.proc` that is called with `JSR`.
+- `cycles_per_call`, `min_cycles` and `max_cycles`. The minimum and maximum
+  are over the calls that have returned.
+- `file` and `line`, with debug info.
+
+`sort` can be `cycles` (default), `calls` or `address`. The filters `from`,
+`to`, `bank` and `within` apply to the routine's address.
+
+With `routine` (a label or address), the report gives just that routine (in
+`routines`, one entry per bank it ran in), with:
+
+- `callers`: who called it, how often, and its cycles for those calls. A caller
+  can be `routine: null` with `from: "outside"` (no tracked routine) or
+  `from: "interrupt"`.
+- `callees`: what it called, how often, and their cycles.
+
+The totals gain `call_tracking`:
+
+- `calls`, and `tail_calls` among them;
+- `interrupts` and `interrupt_cycles`;
+- `max_depth`, the deepest nesting of calls;
+- `open_frames`, the calls still running;
+- `depth_overflows`, calls not tracked because more than 4096 were nested.
+
+For example, in one OtterVeX demo, `vex_draw_triangle`'s own instructions are
+about 6% of the time. With its calls, `by: "routine"` gives 29.9%, and
+`routine: "vex_draw_triangle"` shows where it goes: `ovx_tri_fill` 24.4%,
+`ovx_tri_slope` 12.5% and `ovx_tri_check` 3.7%.
 
 ### Mouse
 
@@ -729,7 +809,7 @@ has the helpers (`Emu`, `check`, `wait_screen`, ...).
 | `src/mcp_hash.c` | SHA-256 for `hash_memory` (CRC32 comes from zlib) |
 | `src/mcp_paths.c` | The host path policy: root, restriction, `..` handling |
 | `src/mcp_symbols.c` | Label files, name lookup and naming addresses |
-| `src/profiler.c`, `src/profiler.h` | The profiler: cycles and counts per instruction address. Not MCP code; the MCP tools are its front end. Without `PROFILER` the header has empty stubs. |
+| `src/profiler.c`, `src/profiler.h` | The profiler: cycles and counts per instruction address, and call tracking (frames matched by the stack pointer, found from the opcode each step ran: no hooks in the CPU core). Not MCP code; the MCP tools are its front end. Without `PROFILER` the header has empty stubs. |
 
 A thread reads and parses requests; each `tools/call` becomes a job that the
 **emulator thread** runs at the top of `emulator_loop`, so tools can touch
