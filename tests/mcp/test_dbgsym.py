@@ -164,6 +164,37 @@ check("a watchpoint stop gives the accessing instruction's position too",
       and (r.get("file"), r.get("line")) == ("d.c", 7), r)
 e.ok("clear_watchpoint", {"all": True})
 
+# ---- profile by source line ----
+e.ok("set_breakpoint", {"address": REPEAT + 3})   # the rts after the .repeat: macros' code up to there
+e.ok("set_registers", {"pc": "macros", "status": 0x24})
+e.ok("profile_start")
+e.ok("continue", {"wait": True})
+e.ok("clear_breakpoint", {"all": True})
+e.ok("profile_stop")
+pl = e.ok("profile_report", {"by": "line", "limit": 100})
+L = {(x["file"], x["line"]): x for x in pl["entries"]}
+check("by line: the macro and .repeat body lines add up their expansions",
+      sorted(L) == [("c.s", 5), ("c.s", 6), ("c.s", 16), ("c.s", 20)], sorted(L))
+check("by line: clc (c.s:5) from three expansions, two of them nested", (L[("c.s", 5)]["addresses"], L[("c.s", 5)]["instructions"], L[("c.s", 5)]["cycles"]) == (3, 3, 6), L[("c.s", 5)])
+check("by line: the .repeat body line (c.s:20) is one entry for its 3 copies", (L[("c.s", 20)]["addresses"], L[("c.s", 20)]["cycles"]) == (3, 6), L[("c.s", 20)])
+check("by line: an entry gives the lowest address, its bank and its label", L[("c.s", 5)]["address"] == "0x%04X" % NESTED[0]
+      and L[("c.s", 5)]["bank"] is None and L[("c.s", 5)]["symbol"] == "macros+0x2", L[("c.s", 5)])
+check("by line: entries add up to instruction_cycles", sum(x["cycles"] for x in pl["entries"]) == pl["instruction_cycles"])
+po = e.ok("profile_report", {"by": "line", "line_level": "outermost", "limit": 100})
+O = {(x["file"], x["line"]): (x["addresses"], x["cycles"]) for x in po["entries"]}
+check("line_level outermost: the lines that use the macros, and .endrepeat", O == {("c.s", 16): (1, 2), ("c.s", 17): (4, 8), ("c.s", 18): (2, 4), ("c.s", 21): (3, 6)}, O)
+e.ok("set_breakpoint", {"address": C_LINES[4]})    # count3's rts
+e.ok("set_registers", {"pc": "_count3", "status": 0x24})
+e.ok("profile_start")
+e.ok("continue", {"wait": True})
+e.ok("clear_breakpoint", {"all": True})
+e.ok("profile_stop")
+pc_ = e.ok("profile_report", {"by": "line"})
+C = {(x["file"], x["line"]): x["addresses"] for x in pc_["entries"]}
+check("by line: C code counts for its C lines", C == {("d.c", 6): 1, ("d.c", 7): 1, ("d.c", 8): 4}, C)
+err, t = e.call("profile_report", {"by": "scope", "line_level": "outermost"}); check("line_level needs by line", err and "line_level" in t, t)
+err, t = e.call("profile_report", {"by": "line", "sort": "address"}); check("by line has no sort", err and "sort" in t, t)
+
 # ---- the label file on top: merged, scoped names kept ----
 r = e.ok("load_symbols", {"path": "scoped.sym"})
 check("the label file (20 lines, five labels twice) merges into the debug info", r["format"] == "labels" and r["loaded"] == 20 and r["merged"] == 20 and r["total"] == 16, r)
@@ -178,6 +209,7 @@ check("name@$XXXX works for the label file", addr_of("loop@$%04X" % INNER_LOOP) 
 check("unique names are unchanged", name_of(PROCA) == "procA" and name_of(TABLE) == "table")
 
 err, t = e.call("profile_report", {"by": "scope"}); check("by scope without debug info says to load it", err and "debug info" in t, t)
+err, t = e.call("profile_report", {"by": "line"}); check("by line without debug info says to load it", err and "debug info" in t, t)
 
 # ---- errors ----
 open(os.path.join(tmp, "v3.dbg"), "w").write("version\tmajor=3,minor=0\nsym\tid=0,name=\"x\",val=0x10,type=lab\n")

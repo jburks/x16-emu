@@ -2542,6 +2542,9 @@ typedef struct {
 	const char *sym;       // nearest label (filled when needed), NULL if none; for by scope the scope's path
 	uint16_t sym_address;
 	bool is_scope;         // sym is a scope path (by scope), not a label
+	const char *file;      // by line: the source line, NULL if none
+	unsigned line;
+	uint32_t addresses;    // by line: how many addresses the group has
 } prof_row;
 
 typedef struct {
@@ -2573,6 +2576,9 @@ prof_collect(void *ctx, uint16_t address, int bank, uint64_t cycles, uint64_t co
 	row->sym = NULL;
 	row->sym_address = 0;
 	row->is_scope = false;
+	row->file = NULL;
+	row->line = 0;
+	row->addresses = 1;
 }
 
 // A memory region: -1 below $A000, the RAM bank for $A000-$BFFF, 256 + the ROM bank from $C000 up.
@@ -2603,6 +2609,18 @@ prof_by_group(const void *a, const void *b)
 		if (c) return c;
 	}
 	return prof_region(x) - prof_region(y);
+}
+
+// Groups for the line view: rows from the same source line (code without one: the same region) are merged.
+static int
+prof_by_line(const void *a, const void *b)
+{
+	const prof_row *x = a, *y = b;
+	if (!x->file != !y->file) return x->file ? -1 : 1;
+	if (!x->file) return prof_region(x) - prof_region(y);
+	int c = x->file == y->file ? 0 : strcmp(x->file, y->file);
+	if (c) return c;
+	return x->line < y->line ? -1 : x->line > y->line;
 }
 
 static void
@@ -2654,6 +2672,42 @@ prof_append_group(json_buf *b, const prof_row *g, uint64_t total, bool by_scope)
 	prof_append_percent(b, g->cycles, total);
 	snprintf(tmp, sizeof(tmp), ",\"instructions\":%llu}", (unsigned long long)g->count);
 	json_buf_append(b, tmp);
+}
+
+// One entry of the line view.
+static void
+prof_append_line(json_buf *b, const prof_row *g, uint64_t total)
+{
+	char tmp[200];
+	if (g->file) {
+		json_buf_append(b, "{\"file\":");
+		json_buf_append_string(b, g->file, strlen(g->file));
+		snprintf(tmp, sizeof(tmp), ",\"line\":%u", g->line);
+		json_buf_append(b, tmp);
+	} else {
+		int region = prof_region(g);
+		if (region < 0) snprintf(tmp, sizeof(tmp), "{\"file\":null,\"line\":null,\"region\":\"low memory\"");
+		else if (region < 256) snprintf(tmp, sizeof(tmp), "{\"file\":null,\"line\":null,\"region\":\"RAM bank %d\"", region);
+		else snprintf(tmp, sizeof(tmp), "{\"file\":null,\"line\":null,\"region\":\"ROM bank %d\"", region - 256);
+		json_buf_append(b, tmp);
+	}
+	snprintf(tmp, sizeof(tmp), ",\"address\":\"0x%04X\"", g->address);
+	json_buf_append(b, tmp);
+	prof_append_bank(b, g->bank);
+	snprintf(tmp, sizeof(tmp), ",\"addresses\":%u,\"cycles\":%llu", g->addresses, (unsigned long long)g->cycles);
+	json_buf_append(b, tmp);
+	prof_append_percent(b, g->cycles, total);
+	snprintf(tmp, sizeof(tmp), ",\"instructions\":%llu", (unsigned long long)g->count);
+	json_buf_append(b, tmp);
+	if (g->sym) { // the label of the lowest address, for orientation
+		char sym[320];
+		unsigned off = (unsigned)g->address - g->sym_address;
+		if (off) snprintf(sym, sizeof(sym), "%s+0x%X", g->sym, off);
+		else snprintf(sym, sizeof(sym), "%s", g->sym);
+		json_buf_append(b, ",\"symbol\":");
+		json_buf_append_string(b, sym, strlen(sym));
+	}
+	json_buf_append(b, "}");
 }
 
 // One entry of the address view.
@@ -3062,8 +3116,9 @@ run_profile_report(mcp_job *job)
 	const json_node *byn = json_get(job->args, "by"), *sn = json_get(job->args, "sort"), *wn = json_get(job->args, "within");
 	const json_node *rtn = json_get(job->args, "routine");
 	const char *by = byn ? json_as_string(byn) : rtn ? "routine" : "symbol";
-	if (!by || (strcmp(by, "symbol") && strcmp(by, "scope") && strcmp(by, "address") && strcmp(by, "routine"))) {
-		mcp_job_fail(job, "by must be \"symbol\", \"scope\", \"address\" or \"routine\"");
+	if (!by || (strcmp(by, "symbol") && strcmp(by, "scope") && strcmp(by, "address") && strcmp(by, "routine") &&
+	            strcmp(by, "line"))) {
+		mcp_job_fail(job, "by must be \"symbol\", \"scope\", \"line\", \"address\" or \"routine\"");
 		return true;
 	}
 	bool by_routine = !strcmp(by, "routine");
@@ -3083,6 +3138,22 @@ run_profile_report(mcp_job *job)
 		mcp_job_fail(job, "scope_level applies to by \"scope\" only");
 		return true;
 	}
+	bool by_line = !strcmp(by, "line");
+	const json_node *lln = json_get(job->args, "line_level");
+	const char *line_level = lln ? json_as_string(lln) : "innermost";
+	if (!line_level || (strcmp(line_level, "innermost") && strcmp(line_level, "outermost"))) {
+		mcp_job_fail(job, "line_level must be \"innermost\" or \"outermost\"");
+		return true;
+	}
+	if (lln && !by_line) {
+		mcp_job_fail(job, "line_level applies to by \"line\" only");
+		return true;
+	}
+	if (by_line && !mcp_sym_line_count()) {
+		mcp_job_fail(job, "by \"line\" needs source lines, which come from cc65 debug info: load_symbols with the "
+		             "program's .dbg file (ld65 --dbgfile; assemble with ca65 -g)");
+		return true;
+	}
 	if (by_scope && !mcp_sym_scope_count()) {
 		mcp_job_fail(job, "by \"scope\" needs scopes, which come from cc65 debug info: load_symbols with the program's "
 		             ".dbg file (ld65 --dbgfile)");
@@ -3097,8 +3168,9 @@ run_profile_report(mcp_job *job)
 		mcp_job_fail(job, "sort \"calls\" applies to by \"routine\" only");
 		return true;
 	}
-	if (sn && by_symbol) {
-		mcp_job_fail(job, "sort applies to by \"address\" and \"routine\" only (symbols and scopes are always ordered by cycles)");
+	if (sn && (by_symbol || by_line)) {
+		mcp_job_fail(job, "sort applies to by \"address\" and \"routine\" only (symbols, scopes and lines are always "
+		             "ordered by cycles)");
 		return true;
 	}
 	const char *within = NULL;
@@ -3189,7 +3261,36 @@ run_profile_report(mcp_job *job)
 			r.sym_address = ss;
 			r.is_scope = true;
 		}
+		mcp_sym_source src;
+		if (by_line && mcp_sym_source_at(r.address, r.bank, &src)) {
+			bool body = src.macro_file && strcmp(line_level, "outermost");
+			r.file = body ? src.macro_file : src.file;
+			r.line = body ? src.macro_line : src.line;
+		}
 		rows.rows[n++] = r;
+	}
+	// Line view: merge the rows of each source line, keeping the lowest address (and its label)
+	if (by_line && n) {
+		qsort(rows.rows, n, sizeof(prof_row), prof_by_line);
+		size_t m = 0;
+		for (size_t i = 0; i < n; i++) {
+			prof_row *g = m ? &rows.rows[m - 1] : NULL;
+			const prof_row *r = &rows.rows[i];
+			if (g && !prof_by_line(g, r)) {
+				g->cycles += r->cycles;
+				g->count += r->count;
+				g->addresses++;
+				if (prof_region(r) < prof_region(g) || (prof_region(r) == prof_region(g) && r->address < g->address)) {
+					g->address = r->address;
+					g->bank = r->bank;
+					g->sym = r->sym;
+					g->sym_address = r->sym_address;
+				}
+			} else {
+				rows.rows[m++] = *r;
+			}
+		}
+		n = m;
 	}
 	// Symbol view: merge each label's rows (per region) into one, keeping the label's address
 	if (by_symbol && n) {
@@ -3205,7 +3306,7 @@ run_profile_report(mcp_job *job)
 		}
 		n = m;
 	}
-	if (by_symbol || !strcmp(sort, "cycles")) {
+	if (by_symbol || by_line || !strcmp(sort, "cycles")) {
 		qsort(rows.rows, n, sizeof(prof_row), prof_by_cycles);
 	} // else: address order, as visited (low memory, then RAM banks, then ROM banks)
 
@@ -3226,6 +3327,7 @@ run_profile_report(mcp_job *job)
 	for (size_t i = 0; i < count; i++) {
 		if (i) json_buf_append(out, ",");
 		if (by_symbol) prof_append_group(out, &rows.rows[first + i], total, by_scope);
+		else if (by_line) prof_append_line(out, &rows.rows[first + i], total);
 		else prof_append_address(out, &rows.rows[first + i], total);
 	}
 	json_buf_append(out, "]}");
@@ -3258,6 +3360,11 @@ static const mcp_tool tool_profile_report = {
 	".scope counts for that scope, inner labels included; entries give scope (the path), address (its start), "
 	"cycles, percent and instructions. Nested scopes count for the innermost one, or with scope_level \"outermost\" "
 	"for the outermost. Code outside every scope is grouped by label as in by \"symbol\", with scope null. "
+	"by \"line\" (needs cc65 debug info) adds up each source line: entries give file, line, address (the lowest), "
+	"bank, addresses (how many), cycles, percent, instructions and symbol (of the lowest address). Code from a macro "
+	"or .repeat counts for the line in its body (all expansions of a macro line add up), or with line_level "
+	"\"outermost\" for the line that uses the macro (the .endrepeat line for .repeat); C counts for its C line. Code "
+	"without a source line is grouped per memory region (file null, region). "
 	"by \"address\" lists single instructions: address, bank, cycles, percent, count (times executed), symbol "
 	"(name+0xN), with debug info file and line (and macro_file/macro_line for code from a macro; see load_symbols), "
 	"and text (the instruction as it is in memory now); sort \"address\" lists them in address order, to "
@@ -3275,7 +3382,8 @@ static const mcp_tool tool_profile_report = {
 	"whole report (every entry) is written to that host file as JSON, inside the host path root, and only the totals "
 	"are returned; an existing file is replaced only with overwrite.",
 	"{\"type\":\"object\",\"properties\":{"
-		"\"by\":{\"type\":\"string\",\"enum\":[\"symbol\",\"scope\",\"address\",\"routine\"],\"default\":\"symbol\"},"
+		"\"by\":{\"type\":\"string\",\"enum\":[\"symbol\",\"scope\",\"line\",\"address\",\"routine\"],\"default\":\"symbol\"},"
+		"\"line_level\":{\"type\":\"string\",\"enum\":[\"innermost\",\"outermost\"],\"default\":\"innermost\"},"
 		"\"routine\":{\"type\":[\"integer\",\"string\"]},"
 		"\"scope_level\":{\"type\":\"string\",\"enum\":[\"innermost\",\"outermost\"],\"default\":\"innermost\"},"
 		"\"sort\":{\"type\":\"string\",\"enum\":[\"cycles\",\"address\",\"calls\"],\"default\":\"cycles\"},"

@@ -548,7 +548,7 @@ same profile every time.
 |---|---|---|
 | `profile_start` | `reset`, `calls` | Starts counting. `reset` (default `true`) clears earlier counts; `false` adds to them. `calls: true` also tracks subroutine calls, for `by: "routine"`. |
 | `profile_stop` | none | Stops counting and returns the totals. The counts are kept until the next `profile_start` with `reset`. |
-| `profile_report` | `by`, `routine`, `scope_level`, `sort`, `from`, `to`, `bank`, `within`, `limit`, `offset`, `path`, `overwrite` | The totals and the counted entries, highest cycles first. `by: "symbol"` (default) adds up the addresses of each label; `by: "scope"` adds up each routine (needs debug info); `by: "address"` lists single instructions; `by: "routine"` lists called routines with the time of what they call (needs `calls: true`), and `routine` gives one routine with its callers and callees. |
+| `profile_report` | `by`, `routine`, `scope_level`, `line_level`, `sort`, `from`, `to`, `bank`, `within`, `limit`, `offset`, `path`, `overwrite` | The totals and the counted entries, highest cycles first. `by: "symbol"` (default) adds up the addresses of each label; `by: "scope"` adds up each routine (needs debug info); `by: "line"` adds up each source line (needs debug info); `by: "address"` lists single instructions; `by: "routine"` lists called routines with the time of what they call (needs `calls: true`), and `routine` gives one routine with its callers and callees. |
 
 Every result starts with the totals:
 
@@ -589,6 +589,20 @@ without debug info) is grouped by label as in `by: "symbol"`, with
 `tri_fill::have` 6.8%, `tri_fill::row` 4.5% and `tri_fill::next` 3.5%; the
 scope view shows `tri_fill` as one entry at 19.7%.
 
+Entries of `by: "line"` add up each source line, from the program's cc65 debug
+info. Code from a macro or `.repeat` counts for the line in its body, so one
+macro line adds up all its expansions, and a `.repeat` run of hundreds of
+instructions is one entry. With `line_level: "outermost"` it counts for the
+line that uses the macro instead (for `.repeat`, the `.endrepeat` line, as ca65
+records it). C compiled by cc65 counts for its C lines. Entries give `file`,
+`line`, `address` (the lowest address the line produced that ran), `bank`,
+`addresses` (how many of its addresses ran), `cycles`, `percent`,
+`instructions` and `symbol` (the label of that lowest address, for
+orientation). Code without a source line (the ROM, or code without debug info)
+is grouped per memory region, with `file: null` and `region`. For example, an
+unrolled `.repeat 320` of `sta VERA_DATA1` in one OtterVeX demo is a single
+entry, `plot.inc:9`, at 6.7%, not 26 address entries.
+
 Entries of `by: "address"` give `address`, `bank`, `cycles`, `percent`, `count`
 (times executed), `symbol` (`name+0xN`), with debug info `file` and `line` (and
 `macro_file`/`macro_line` for code from a macro; see "Debug info and scopes"),
@@ -615,6 +629,9 @@ Tips:
   the same counts.
 - **Find the hot routines, then the hot instructions:** `by: "scope"` first,
   then `by: "address"` with `within: "<the routine>"` and `sort: "address"`.
+- **Find the hot source lines:** `by: "line"`, which also shows a macro line
+  that is hot across every routine that uses it. `within` limits it to one
+  routine.
 - **Find what a routine costs with everything it calls:** `calls: true`, then
   `by: "routine"`, then `routine: "<name>"` for where its time goes.
 - Profiling makes the emulator a little slower; stop it when you are done.
